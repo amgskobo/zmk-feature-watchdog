@@ -6,31 +6,35 @@
 
 #include <errno.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
-#include <pb_decode.h>
-#include <pb_encode.h>
-#include <zephyr/kernel.h>
-#include <zephyr/sys/util.h>
-#include <zmk/studio/custom.h>
 #include <cormoran/watchdog/watchdog.pb.h>
 #include <cormoran/zmk/watchdog.h>
 #include <cormoran/zmk/watchdog_request_exec.h>
+#include <cormoran/zmk/watchdog_studio.h>
+#include <pb_decode.h>
+#include <pb_encode.h>
+#include <zephyr/init.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
+#include <zmk/studio/core.h>
+#include <zmk/studio/custom.h>
 
 #if IS_ENABLED(CONFIG_ZMK_WATCHDOG_SPLIT_RELAY)
 #include <cormoran/zmk/watchdog_relay.h>
 #endif
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+#ifndef CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL
+#define CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL 3
+#endif
+LOG_MODULE_REGISTER(zmk_watchdog_fork_watchdog_handler, CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL);
+
+#define WATCHDOG_SUBSYSTEM_IDENTIFIER "cormoran__watchdog"
 
 static struct zmk_rpc_custom_subsystem_meta watchdog_feature_meta = {
-    ZMK_RPC_CUSTOM_SUBSYSTEM_UI_URLS("http://cormoran.github.io/zmk-feature-watchdog/"),
-    // Secured by default: the incident log requires an unlocked device.
-    // Set CONFIG_ZMK_WATCHDOG_STUDIO_RPC_UNSECURED=y to expose it while
-    // locked -- useful in un-reliable environments where a broken keyboard
-    // may not be able to type the &studio_unlock combo.
+    ZMK_RPC_CUSTOM_SUBSYSTEM_UI_URLS("https://cormoran.github.io/zmk-feature-watchdog/"),
+/* The incident log requires an unlocked device unless configured otherwise. */
 #if IS_ENABLED(CONFIG_ZMK_WATCHDOG_STUDIO_RPC_UNSECURED)
     .security = ZMK_STUDIO_RPC_HANDLER_UNSECURED,
 #else
@@ -45,91 +49,94 @@ ZMK_RPC_CUSTOM_SUBSYSTEM(cormoran__watchdog, &watchdog_feature_meta, watchdog_rp
 
 ZMK_RPC_CUSTOM_SUBSYSTEM_RESPONSE_BUFFER(cormoran__watchdog, cormoran_watchdog_Response);
 
-/* ------------------------------------------------------------------------
- * Record -> proto conversion now lives in src/studio/watchdog_request_exec.c
- * (watchdog_incident_record_to_proto()), shared with the split relay
- * peripheral responder (src/split/watchdog_relay.c) -- see DESIGN.md SS7.
- * ---------------------------------------------------------------------- */
+/* --- Notifications --- */
 
-/* ------------------------------------------------------------------------
- * IncidentRecorded notification: fired whenever zmk_watchdog_store_append()
- * persists a new incident, so the web UI sees new incidents live without
- * polling. The store itself doesn't know about Studio RPC (DESIGN.md SS6-SS7
- * keep it transport-agnostic, since peripherals share the same store code
- * but have no Studio RPC subsystem), so it exposes a generic append callback
- * (zmk_watchdog_store_set_appended_callback(), src/watchdog_store.c) that
- * this file registers at boot instead of the store depending on us.
- *
- * This fires for every append: the boot-time reset-cause audit
- * (src/watchdog_reset_cause.c, appends directly from ordinary boot context)
- * and, after a freeze/fatal-triggered reboot, the *next* boot's pending-slot
- * conversion (src/watchdog_pending.c's zmk_watchdog_pending_convert(), which
- * itself calls zmk_watchdog_store_append()).
- * ---------------------------------------------------------------------- */
-
-static K_MUTEX_DEFINE(notification_buffer_lock);
-static cormoran_watchdog_Notification notification_buffer;
+static bool notifications_allowed(void) {
+    return IS_ENABLED(CONFIG_ZMK_WATCHDOG_STUDIO_RPC_UNSECURED) ||
+           zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
+}
 
 static bool encode_notification_payload(pb_ostream_t *stream, const pb_field_t *field,
                                         void *const *arg) {
-    const cormoran_watchdog_Notification *notification =
-        (const cormoran_watchdog_Notification *)*arg;
+    struct watchdog_studio_notification *notification = *arg;
+    /* The first pass runs after the transport wait. Failing a later pass would
+     * leave the Studio frame unterminated, so the decision is kept. */
+    if (!notification->decided) {
+        notification->allowed = notifications_allowed();
+        notification->decided = true;
+    }
+    if (!notification->allowed) {
+        return true; /* suppress the content, not the completion of the frame */
+    }
     return zmk_rpc_custom_subsystem_encode_response_payload(
-        stream, field, cormoran_watchdog_Notification_fields, notification);
+        stream, field, cormoran_watchdog_Notification_fields, &notification->payload);
 }
 
-static int custom_subsystem_index(void) {
-    size_t subsystem_count;
-    STRUCT_SECTION_COUNT(zmk_rpc_custom_subsystem, &subsystem_count);
+/* The registry is fixed at link time, so the index is looked up once. */
+static int subsystem_index(void) {
+    static int index = -ENOENT;
+    if (index >= 0) {
+        return index;
+    }
 
-    for (size_t i = 0; i < subsystem_count; i++) {
-        struct zmk_rpc_custom_subsystem *custom_subsys;
-        STRUCT_SECTION_GET(zmk_rpc_custom_subsystem, i, &custom_subsys);
-        if (strcmp(custom_subsys->identifier, "cormoran__watchdog") == 0) {
-            return (int)i;
+    size_t count;
+    STRUCT_SECTION_COUNT(zmk_rpc_custom_subsystem, &count);
+    for (size_t i = 0; i < count; i++) {
+        struct zmk_rpc_custom_subsystem *subsystem;
+        STRUCT_SECTION_GET(zmk_rpc_custom_subsystem, i, &subsystem);
+        if (strcmp(subsystem->identifier, WATCHDOG_SUBSYSTEM_IDENTIFIER) == 0) {
+            index = (int)i;
+            return index;
         }
     }
     return -ENOENT;
 }
 
-static void on_incident_appended(uint16_t id, const struct zmk_watchdog_incident_record *rec) {
-    int index = custom_subsystem_index();
+int watchdog_studio_notify(struct watchdog_studio_notification *notification) {
+    if (!notifications_allowed()) {
+        return -EACCES;
+    }
+    int index = subsystem_index();
     if (index < 0) {
-        return;
+        return index;
     }
 
-    k_mutex_lock(&notification_buffer_lock, K_FOREVER);
+    notification->decided = false;
+    return raise_zmk_studio_custom_notification((struct zmk_studio_custom_notification){
+        .subsystem_index = (uint8_t)index,
+        .encode_payload =
+            {
+                .funcs.encode = encode_notification_payload,
+                .arg = notification,
+            },
+    });
+}
 
-    cormoran_watchdog_Notification *notification = &notification_buffer;
+/* IncidentRecorded: every persisted incident, including the boot-time
+ * reset-cause audit and the pending conversion after a freeze/fatal reboot,
+ * so the client sees new incidents without polling. */
+static K_MUTEX_DEFINE(incident_notification_lock);
+static struct watchdog_studio_notification incident_notification;
+
+static void on_incident_appended(uint16_t id, const struct zmk_watchdog_incident_record *rec) {
+    k_mutex_lock(&incident_notification_lock, K_FOREVER);
+
+    cormoran_watchdog_Notification *notification = &incident_notification.payload;
     *notification = (cormoran_watchdog_Notification)cormoran_watchdog_Notification_init_zero;
     notification->which_notification_type = cormoran_watchdog_Notification_incident_recorded_tag;
     notification->notification_type.incident_recorded.has_incident = true;
-    /* source = 0: this callback only fires for incidents this half's own
-     * store just persisted (see the doc comment above). */
+    /* Source 0: the callback fires only for this half's own store. */
     watchdog_incident_record_to_proto(id, 0, rec,
                                       &notification->notification_type.incident_recorded.incident);
 
-    pb_callback_t payload = {
-        .funcs.encode = encode_notification_payload,
-        .arg = notification,
-    };
-
-    int ret = raise_zmk_studio_custom_notification((struct zmk_studio_custom_notification){
-        .subsystem_index = (uint8_t)index,
-        .encode_payload = payload,
-    });
-    if (ret < 0) {
+    int ret = watchdog_studio_notify(&incident_notification);
+    if (ret < 0 && ret != -EACCES) {
         LOG_WRN("Failed to raise watchdog IncidentRecorded notification: %d", ret);
     }
 
-    k_mutex_unlock(&notification_buffer_lock);
+    k_mutex_unlock(&incident_notification_lock);
 }
 
-/* Registered at boot (APPLICATION level, after the store's own SYS_INIT --
- * see CMakeLists.txt/Kconfig ordering notes) so every zmk_watchdog_store_append()
- * from this point on -- including the boot-time reset-cause audit
- * (src/watchdog_reset_cause.c) and the *next* boot's pending-slot conversion
- * after a freeze/fatal reboot -- raises a live notification. */
 static int watchdog_studio_rpc_init(void) {
     zmk_watchdog_store_set_appended_callback(on_incident_appended);
     return 0;
@@ -137,41 +144,7 @@ static int watchdog_studio_rpc_init(void) {
 
 SYS_INIT(watchdog_studio_rpc_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
-/* ------------------------------------------------------------------------
- * Request handlers: GetStatus/ListIncidents/DeleteIncidents execution
- * against the local store lives in src/studio/watchdog_request_exec.c
- * (watchdog_request_exec_handle()), shared with the split relay peripheral
- * responder. This file only needs to decide *where* a request should run:
- * locally (source == 0) or relayed to a split peripheral (source != 0, see
- * DESIGN.md SS7) -- and, for the latter, only when
- * CONFIG_ZMK_WATCHDOG_SPLIT_RELAY is actually enabled.
- * ---------------------------------------------------------------------- */
-
-static void set_error(cormoran_watchdog_Response *resp, const char *message) {
-    cormoran_watchdog_ErrorResponse err = cormoran_watchdog_ErrorResponse_init_zero;
-    snprintf(err.message, sizeof(err.message), "%s", message);
-    resp->which_response_type = cormoran_watchdog_Response_error_tag;
-    resp->response_type.error = err;
-}
-
-/* Returns the `source` field of a GetStatus/ListIncidents/DeleteIncidents
- * request (0 if the request kind is unset/unsupported -- routed to the
- * local executor, which will itself produce an ErrorResponse). InjectTest
- * has no `source` field and always falls into the default case: test/fault
- * injection only ever targets this half (see DESIGN.md SS4.4), so it is
- * always executed locally, never relayed to a split peripheral. */
-static uint32_t request_source(const cormoran_watchdog_Request *req) {
-    switch (req->which_request_type) {
-    case cormoran_watchdog_Request_get_status_tag:
-        return req->request_type.get_status.source;
-    case cormoran_watchdog_Request_list_incidents_tag:
-        return req->request_type.list_incidents.source;
-    case cormoran_watchdog_Request_delete_incidents_tag:
-        return req->request_type.delete_incidents.source;
-    default:
-        return 0;
-    }
-}
+/* --- Requests --- */
 
 static bool watchdog_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
                                         pb_callback_t *encode_response) {
@@ -184,17 +157,15 @@ static bool watchdog_rpc_handle_request(const zmk_custom_CallRequest *raw_reques
         pb_istream_from_buffer(raw_request->payload.bytes, raw_request->payload.size);
     if (!pb_decode(&req_stream, cormoran_watchdog_Request_fields, &req)) {
         LOG_WRN("Failed to decode watchdog request: %s", PB_GET_ERROR(&req_stream));
-        set_error(resp, "Failed to decode request");
+        watchdog_response_set_error(resp, "Failed to decode request");
         return true;
     }
 
-    uint32_t source = request_source(&req);
-
-    if (source != 0) {
+    if (watchdog_request_source(&req) != 0) {
 #if IS_ENABLED(CONFIG_ZMK_WATCHDOG_SPLIT_RELAY)
         watchdog_relay_dispatch_request(&req, resp);
 #else
-        set_error(resp, "Split relay not enabled in this firmware");
+        watchdog_response_set_error(resp, "Split relay not enabled in this firmware");
 #endif
         return true;
     }

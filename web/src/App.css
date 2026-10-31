@@ -125,3 +125,27 @@
   gap: 0.5rem;
   margin-top: 1rem;
 }
+
+.report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.card pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+@media (max-width: 600px) {
+  .app {
+    padding: 0.75rem;
+  }
+  .card {
+    padding: 1rem;
+  }
+  .status-grid {
+    grid-template-columns: 1fr;
+    overflow-wrap: anywhere;
+  }
+}

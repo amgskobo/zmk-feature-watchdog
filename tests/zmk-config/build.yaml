@@ -18,7 +18,7 @@ include:
     shield: tester_xiao
     cmake-args: -DCONFIG_ZMK_WATCHDOG=y -DCONFIG_ZMK_WATCHDOG_FREEZE_DETECT=y -DCONFIG_ZMK_WATCHDOG_FATAL_DETECT=y
 
-  # Dedicated test-injection build (DESIGN.md SS4.4/SS12): proves
+  # Dedicated test-injection build (DESIGN.md, Studio RPC, split relay and client): proves
   # CONFIG_ZMK_WATCHDOG_TEST_INJECTION (+ its RPC wiring in
   # src/studio/watchdog_request_exec.c) compiles for a real board target, not
   # just native_sim -- kept as its own artifact rather than enabling
@@ -43,12 +43,12 @@ include:
     cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_WATCHDOG=y -DCONFIG_ZMK_WATCHDOG_STUDIO_RPC=y -DCONFIG_ZMK_CUSTOM_SETTINGS=y -DCONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
     snippet: studio-rpc-usb-uart
 
-  # Split keyboard build coverage (DESIGN.md SS7): peripheral role (relay +
+  # Split keyboard build coverage (DESIGN.md, Studio RPC, split relay and client): peripheral role (relay +
   # watchdog core, no Studio of its own) and central role (local RPC + relay
   # proxy) built as separate firmware images, proving both roles compile --
   # end-to-end relay behavior is covered by the native_sim
   # tests/split_peripheral test (no real split hardware in this environment;
-  # see DESIGN.md SS12).
+  # see tests/README.md).
   - artifact: module_watchdog_split_peripheral
     board: xiao_ble//zmk
     shield: tester_xiao

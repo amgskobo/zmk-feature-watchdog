@@ -1,0 +1,17 @@
+mainmenu "Watchdog trace kernel fixture"
+config ZMK_WATCHDOG_FREEZE_TRACE
+    bool
+    default y
+    select THREAD_STACK_INFO
+source "Kconfig.zephyr"
+config ZMK_WATCHDOG_DIAGNOSTICS
+    bool
+    default y
+    select CRC
+config ZMK_WATCHDOG_DIAGNOSTICS_TEST
+    bool
+    default y
+config ZMK_WATCHDOG_CAPTURE_CONTEXT
+    bool
+    default y
+    select EXTRA_EXCEPTION_INFO

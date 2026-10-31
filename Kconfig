@@ -10,20 +10,44 @@ if ZMK_WATCHDOG
 config ZMK_WATCHDOG_MAX_INCIDENTS
     int "Maximum number of stored incidents (flash slot cap, per half)"
     default 16
+    range 1 65535
     help
-      Flash-wear protection: once this many incidents are stored, recording
-      stops (no ring-buffer overwrite) until the user deletes incidents.
+      Once this many incidents are stored, a new one is dropped and counted
+      without writing Flash until incidents are deleted, unless
+      ZMK_WATCHDOG_OVERWRITE_OLDEST is enabled.
+
+config ZMK_WATCHDOG_OVERWRITE_OLDEST
+    bool "Overwrite the oldest stored incident when the store is full"
+    help
+      A new incident replaces the one with the lowest incident ordinal, so
+      the newest ZMK_WATCHDOG_MAX_INCIDENTS incidents are kept and recording
+      never stops. A failed write keeps the old incident. Incident IDs keep
+      increasing; the replaced ID is gone. An incident earlier than
+      ZMK_WATCHDOG_OVERWRITE_MIN_UPTIME_S after boot is still dropped when
+      the store is full. A positive minimum uptime suppresses earlier
+      crash-loop replacements; zero permits every incident to replace one.
+      This is not a Flash wear guarantee.
+
+config ZMK_WATCHDOG_OVERWRITE_MIN_UPTIME_S
+    int "Smallest uptime (s) of an incident that may overwrite the oldest one"
+    depends on ZMK_WATCHDOG_OVERWRITE_OLDEST
+    default 10
+    range 0 3600
+    help
+      Incident-age gate for replacing a record in a full store. This is not
+      a global write-rate limit: free slots and multiple qualifying appends
+      are separate cases. 0 permits replacement for every incident.
 
 config ZMK_WATCHDOG_PENDING_CONVERT_DELAY_MS
-    int "Delay before converting a pending incident at boot (ms)"
+    int "Initial delay and retry interval for pending conversion (ms)"
     default 100
+    range 0 60000
     help
-      The pending-slot boot conversion needs the settings subsystem to have
-      finished settings_load() (called from main(), after every SYS_INIT
-      level runs). There is no "settings loaded" hook to wait on, so
-      conversion is instead scheduled on the low-priority work queue after
-      this delay, which comfortably follows main()'s settings_load() call
-      for the tiny number of keys this module and typical configs persist.
+      A retained incident is written to Flash only after this module's
+      settings commit has run (settings_load() is called from main(), after
+      every SYS_INIT level). Until then the conversion keeps the retained
+      record and retries on the low-priority work queue at this interval;
+      elapsed time alone never permits a write.
 
 config ZMK_WATCHDOG_STUDIO_RPC
     bool "Expose watchdog incident log via custom Studio RPC"
@@ -34,17 +58,13 @@ config ZMK_WATCHDOG_STUDIO_RPC_UNSECURED
     bool "Allow the watchdog Studio RPC while the device is locked"
     depends on ZMK_WATCHDOG_STUDIO_RPC
     help
-      By default the watchdog custom Studio RPC is secured: it requires an
-      unlocked device (&studio_unlock). Enable this to expose it while the
-      device is locked, which is useful in un-reliable environments where a
-      broken keyboard may not be able to type the unlock combo. The incident
-      log is not highly sensitive, but exposing it unlocked is opt-in.
+      By default the RPC and its notifications require an unlocked device
+      (&studio_unlock). Enable this for a keyboard that may be too broken to
+      type the unlock combo. The incident log can contain register and
+      application data; consider who can connect to the transport.
 
-# Hidden: pulls in nanopb (+ the same encoding options ZMK_STUDIO itself
-# implies) for whichever of ZMK_WATCHDOG_STUDIO_RPC/ZMK_WATCHDOG_SPLIT_RELAY
-# is enabled -- a split peripheral build enables the latter without
-# ZMK_STUDIO (which is what normally selects NANOPB), so this module must
-# select it itself rather than assuming ZMK_STUDIO already did.
+# Hidden: a split peripheral needs nanopb for the relay without ZMK_STUDIO,
+# which is what normally selects it.
 config ZMK_WATCHDOG_PROTOBUF
     bool
     select NANOPB
@@ -56,146 +76,74 @@ config ZMK_WATCHDOG_SPLIT_RELAY
     bool "Relay watchdog Studio RPC to split peripherals"
     default y if ZMK_SPLIT
     depends on ZMK_SPLIT_RELAY_EVENT
+    # The central relays on behalf of its own Studio RPC; without it there
+    # is nothing to relay.
+    depends on !ZMK_SPLIT_ROLE_CENTRAL || ZMK_WATCHDOG_STUDIO_RPC
     select ZMK_WATCHDOG_PROTOBUF
     help
-      Verified end-to-end on real split hardware (DESIGN.md SS12.1,
-      2026-07-07): a relayed GetStatus request completes correctly, with
-      the central's DeferredResponse followed by a PeripheralResponse
-      Studio notification carrying the peripheral's real answer.
-      Previous hardware sessions could not get a relayed request to
-      complete and shipped this default off while investigating; the
-      actual cause turned out to be leftover diagnostic code in this
-      module (an early `return` before the peripheral ever executed the
-      request), not a transport or timing issue -- see DESIGN.md SS12.1
-      for the full writeup.
+      Enable on both halves. A GetStatus/ListIncidents/DeleteIncidents
+      request with a nonzero `source` is relayed to the peripherals, and the
+      answer arrives as a PeripheralResponse Studio notification, under the
+      same lock rule as the RPC itself. A page is streamed one incident per
+      relay event, so the framework default
+      CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN is enough.
 
-      Enable on BOTH halves of a split keyboard to reach a peripheral's
-      own incident log through the
-      central's cormoran__watchdog Studio RPC subsystem: any GetStatus/
-      ListIncidents/DeleteIncidents request with a nonzero `source` is
-      relayed to the matching peripheral over CONFIG_ZMK_SPLIT_RELAY_EVENT,
-      and the response arrives back as a PeripheralResponse Studio
-      notification (relaying is asynchronous, unlike a local request). A
-      ListIncidents answer streams one incident per relay event rather
-      than a whole page in one event, so CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN
-      never needs to be raised above its framework default for this module
-      (see src/split/watchdog_relay.c's BUILD_ASSERTs and DESIGN.md SS7.1).
-      Note: the underlying split relay event transport broadcasts to every
-      connected peripheral, not to one addressed peripheral -- with more
-      than one peripheral, every peripheral answers every relayed request
-      (each correctly tagged with its own source), which does not compose
-      well with a UI that only expects an answer from a specific one. Safe
-      to enable for a build with a single peripheral. There is also no way
-      for the central to know which peripheral slots are currently
-      connected, so a relayed request to a disconnected peripheral simply
-      never produces a response -- the web UI must time out on its own.
+      The relay transport broadcasts to every connected peripheral and gives
+      no delivery guarantee. Responses carry their source and request ID,
+      and the client must time out on a peripheral that never answers.
+      Verify split traffic and reconnects on the real keyboard.
 
 config ZMK_WATCHDOG_SPLIT_RELAY_TEST
-    bool "Enable native_sim-only watchdog split relay test hooks"
+    bool "Enable watchdog split relay self-test (test builds only)"
     depends on ZMK_WATCHDOG_SPLIT_RELAY
     help
-      Adds a boot-time self-test that bypasses the real split transport
-      (which native_sim cannot exercise end-to-end) and asserts firmware
-      behavior directly, printing PASS/FAIL to the log:
-        - Peripheral role: synthesizes a relayed ListIncidents/
-          DeleteIncidents request locally and asserts the resulting relay
-          response, exercising watchdog_request_exec_handle() the same way
-          a real relayed request would.
-        - Central role: asserts watchdog_relay_dispatch_request() always
-          returns a DeferredResponse with a distinct, nonzero request_id.
-      Not for production builds.
-
-config ZMK_WATCHDOG_SPLIT_RELAY_TEST_DELAY_MS
-    int "Delay this self-test's boot-time run (ms)"
-    default 0
-    depends on ZMK_WATCHDOG_SPLIT_RELAY_TEST
-    help
-      Both test hooks normally run synchronously inside a SYS_INIT at
-      APPLICATION priority, at the same moment BLE scanning/pairing/GATT
-      discovery are starting. Setting this above 0 defers the test (via a
-      k_work_delayable on the system workqueue) by that many ms instead --
-      purely for A/B hardware experiments isolating whether running
-      *anything* at this exact boot moment (as opposed to this specific
-      test's own logic, which never touches the real BLE transport --
-      see the test's own doc comment) affects radio-scheduling stability.
-      Not expected to matter in itself; kept at 0 unless actively testing
-      that hypothesis (DESIGN.md SS12.1).
+      Adds a boot-time self-test that bypasses the real split transport and
+      prints PASS lines. On a peripheral it executes relayed requests against
+      the local store and checks the relay responses; on a central it checks
+      that dispatch returns distinct, nonzero deferred request IDs.
 
 config ZMK_WATCHDOG_FREEZE_DETECT
     bool "Detect long thread/work-queue freezes via Zephyr's task watchdog"
     default y
     select TASK_WDT
     help
-      Monitors the system workqueue (and the ZMK low-priority workqueue) with
-      one task_wdt channel each, fed by a self-rescheduling k_work_delayable
-      on the monitored queue itself. If a queue is blocked longer than
-      CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS, the feed work never runs and the
-      channel's callback records a FREEZE incident and reboots.
+      Each monitored work queue gets a task_wdt channel, fed twice per
+      timeout by work running on that queue. If the queue is blocked longer
+      than CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS, the channel records a
+      FREEZE incident and reboots. Monitoring is armed during APPLICATION
+      initialization and is software-only: a stop of the whole CPU or of its
+      interrupts is not detected.
 
 if ZMK_WATCHDOG_FREEZE_DETECT
+
+config ZMK_WATCHDOG_FREEZE_TRACE
+    bool "Capture a bounded Cortex-M3/M4 freeze thread trace"
+    depends on (CPU_CORTEX_M3 || CPU_CORTEX_M4) && !SMP && !USERSPACE
+    default y
+    select THREAD_STACK_INFO
+    help
+      At the watchdog timeout, read the monitored thread's state, wait
+      queue, saved stack pointer and at most six code addresses, scanning no
+      more than 1024 bytes inside checked SRAM/stack bounds. Nothing runs
+      ahead of the timeout and nothing is allocated or written to Flash.
+      Stack words are return-address candidates, not a complete unwind.
 
 config ZMK_WATCHDOG_FREEZE_TIMEOUT_MS
     int "Freeze detection timeout (ms)"
     default 10000
+    range 10 600000
     help
-      task_wdt channel timeout for each monitored work queue. The feed period
-      is this value divided by CONFIG_ZMK_WATCHDOG_FREEZE_FEED_DIVISOR. Keep
-      this well above worst-case legitimate stalls (BLE connection storms,
-      settings flash writes) but short enough that a real freeze is noticed
-      quickly.
-
-config ZMK_WATCHDOG_FREEZE_FEED_DIVISOR
-    int "Feed period divisor (feed period = timeout / this)"
-    default 2
-    range 2 10
-    help
-      Each monitored queue's feed work is a k_work_delayable that
-      re-schedules itself every (CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS /
-      this) ms, which under the hood is backed by its own Zephyr k_timer.
-      Lowering this divisor (default 2, meaning "feed twice as often as the
-      timeout") reduces how often that timer fires while staying safely
-      inside the timeout window. A lower feed *frequency* is a mitigation
-      (not a fix) for a real, hardware-confirmed, low-probability BLE
-      controller radio-timing issue on split-central builds: any extra
-      periodic k_timer activity from this module is one more thing that can
-      occasionally coincide with the BLE controller's own extremely tight
-      (~275us) radio-event-preparation timing budget, tripping Zephyr's own
-      LL_ASSERT_OVERHEAD safety check and rebooting -- see DESIGN.md SS12.1.
-      This does not eliminate that risk (it is architecturally outside this
-      module's control -- the LLL radio ISR runs at the highest interrupt
-      priority and this module cannot delay it directly), it only reduces
-      how often this module contributes extra timer load that could
-      coincide with it.
-
-config ZMK_WATCHDOG_FREEZE_STARTUP_DELAY_MS
-    int "Delay before arming the freeze detector after boot (ms)"
-    default 0
-    help
-      task_wdt_init()/task_wdt_add() and this module's own feed timers
-      normally start synchronously inside a SYS_INIT at APPLICATION
-      priority -- i.e. at the same moment the BLE stack is bringing up
-      scanning/pairing/GATT discovery, the busiest and most tightly
-      scheduled period for the radio (DESIGN.md SS12.1). Setting this above
-      0 defers arming (via a k_work_delayable on the system workqueue) by
-      that many ms, so this module's own periodic timer activity doesn't
-      begin until initial connection establishment has settled down. This
-      delays freeze detection coverage by the same amount (a real freeze
-      during the delay window goes undetected) and is an experimental
-      mitigation, not a proven fix -- see DESIGN.md SS12.1 for the hardware
-      test that motivated it and its (inconclusive) result.
+      Keep this well above worst-case legitimate stalls (BLE connection
+      storms, settings flash writes) but short enough that a real freeze is
+      noticed quickly.
 
 config ZMK_WATCHDOG_FREEZE_MONITOR_LOWPRIO_QUEUE
     bool "Also monitor ZMK's low-priority work queue"
     default y
     help
-      In addition to the system workqueue (always monitored -- key event
-      processing lives there, see DESIGN.md SS4.1), also arm a task_wdt
-      channel + feed timer for ZMK's low-priority work queue. Disabling this
-      halves this module's own periodic k_timer footprint (see
-      CONFIG_ZMK_WATCHDOG_FREEZE_FEED_DIVISOR's help for why that matters on
-      split-central builds), at the cost of no longer detecting freezes that
-      are specific to the low-priority queue alone (freezes on the system
-      workqueue, the more critical case, are still caught either way).
+      The system work queue, where key events are processed, is always
+      monitored. Disabling this saves one channel and its feed work, at the
+      cost of missing a freeze of the low-priority queue alone.
 
 endif # ZMK_WATCHDOG_FREEZE_DETECT
 
@@ -205,27 +153,63 @@ config ZMK_WATCHDOG_FATAL_DETECT
     help
       Overrides the weak k_sys_fatal_error_handler() to record a FATAL
       incident (reason, PC, LR, thread name) before rebooting, instead of
-      Zephyr's default behavior of halting forever. Any other code in the
-      application that also overrides k_sys_fatal_error_handler will
-      silently conflict with this one at link time (last object wins) --
-      there is no compile-time error.
+      Zephyr's default of halting forever. Another strong
+      k_sys_fatal_error_handler in the application conflicts at link time;
+      check which one the final ELF selected.
+
+config ZMK_WATCHDOG_DIAGNOSTICS
+    bool "Record bounded recent operations and build identity"
+    default y
+    depends on !SMP
+    help
+      Fixed RAM history with non-blocking writers and bounded fault snapshots:
+      the last seven events, cached profile/USB/endpoint state and a build
+      tag. A completed CRC-checked checkpoint can be recovered after a
+      powered reset. No Flash writes in normal operation, no timers and no
+      key material. RAM retention across a reset is not guaranteed.
+
+config ZMK_WATCHDOG_BLE_DIAGNOSTICS
+    bool "Trace public Bluetooth operations"
+    default y if ZMK_BLE
+    depends on ZMK_WATCHDOG_DIAGNOSTICS && ZMK_BLE
+    help
+      Passive connection callbacks and linker wrappers for bond clear,
+      bt_unpair and bt_conn_disconnect, without changing their results or
+      the connection policy. Calls within the defining object cannot be
+      wrapped.
+
+config ZMK_WATCHDOG_CAPTURE_CONTEXT
+    bool "Capture common CPU context and owner operation records"
+    default y
+    depends on ZMK_WATCHDOG_DIAGNOSTICS && !SMP
+    select THREAD_STACK_INFO
+    select EXTRA_EXCEPTION_INFO if ARCH_HAS_EXTRA_EXCEPTION_INFO && (CPU_CORTEX_M3 || CPU_CORTEX_M4)
+    help
+      Preserve four bounded metadata operations with call sites and full-width
+      arguments. Fatal and freeze records carry the same versioned extension.
+      Cortex-M3/M4 adds checked callee registers, fault-address registers and
+      bounded return-address candidates. Unsupported targets retain operations
+      and explicitly mark unavailable CPU evidence. No periodic sampler or
+      automatic fault injection is added.
+
+config ZMK_WATCHDOG_ASSERT_CONTEXT
+    bool "Record the call site and line of Zephyr assertions"
+    default y
+    depends on ZMK_WATCHDOG_CAPTURE_CONTEXT && ASSERT
+    help
+      Wrap the weak assertion post-action, recording metadata before forwarding
+      its original action unchanged. Controller-specific assertions that bypass
+      this hook still use ordinary fatal capture. Other strong overrides and
+      calls within their defining object remain integration boundaries.
 
 config ZMK_WATCHDOG_TEST_INJECTION
     bool "Enable dangerous test/fault injection helpers"
-    default n
     help
-      Adds internal helpers that deliberately freeze a monitored work queue
-      or trigger a kernel oops, for validating the freeze/fatal detectors
-      end-to-end (native_sim tests, hardware bring-up). Never enable this in
-      a production build.
-
-      Two ways to trigger them once enabled:
-        - Studio RPC (central / non-split boards): cormoran.watchdog's
-          InjectTestRequest, wired up in
-          src/studio/watchdog_request_exec.c.
-        - Boot-delay auto-trigger (split peripherals, which have no Studio
-          RPC of their own): CONFIG_ZMK_WATCHDOG_TEST_INJECT_FREEZE_AT_BOOT_MS /
-          CONFIG_ZMK_WATCHDOG_TEST_INJECT_FATAL_AT_BOOT_MS below.
+      Adds helpers that deliberately freeze a monitored work queue or trigger
+      a kernel oops, to validate the freeze/fatal detectors end to end. Never
+      enable this in a production build. They are triggered by the Studio
+      InjectTestRequest (central or non-split boards), or after a boot delay
+      (split peripherals, which have no Studio RPC of their own).
 
 if ZMK_WATCHDOG_TEST_INJECTION
 
@@ -233,23 +217,15 @@ config ZMK_WATCHDOG_TEST_INJECT_FREEZE_AT_BOOT_MS
     int "Auto-trigger a freeze this many ms after boot (0 = disabled)"
     default 0
     help
-      When > 0, schedules zmk_watchdog_inject_freeze() via a k_work_delayable
-      this many ms after boot. Intended for split peripherals, which have no
-      Studio RPC to receive an on-demand InjectTestRequest -- flash a test
-      build with this set, power-cycle, and observe the freeze/reboot/
-      incident-recorded cycle without needing any host-side tooling. Leave 0
-      (the default) for boards that trigger injection via Studio RPC instead
-      (see CONFIG_ZMK_WATCHDOG_TEST_INJECTION's help).
+      Flash a test build with this set and power-cycle it to observe the
+      freeze, reboot and recorded incident without any host tooling.
 
 config ZMK_WATCHDOG_TEST_INJECT_FATAL_AT_BOOT_MS
     int "Auto-trigger a fatal error this many ms after boot (0 = disabled)"
     default 0
     help
-      Same as CONFIG_ZMK_WATCHDOG_TEST_INJECT_FREEZE_AT_BOOT_MS, but calls
-      zmk_watchdog_inject_fatal() (k_oops()) instead. If both this and
-      CONFIG_ZMK_WATCHDOG_TEST_INJECT_FREEZE_AT_BOOT_MS are set, whichever
-      fires first reboots the device before the other's timer elapses --
-      only set one at a time in practice.
+      Same as CONFIG_ZMK_WATCHDOG_TEST_INJECT_FREEZE_AT_BOOT_MS with
+      k_oops(). If both are set, whichever fires first reboots the device.
 
 endif # ZMK_WATCHDOG_TEST_INJECTION
 
@@ -257,17 +233,23 @@ config ZMK_WATCHDOG_TEST
     bool "Enable watchdog self-test (native_sim only)"
     help
       Adds test-only init logic exercising the store and pending-slot boot
-      conversion. Not for production builds.
+      conversion, and the test hooks it uses. Not for production builds.
 
 config ZMK_WATCHDOG_STUDIO_RPC_TEST
     bool "Enable watchdog Studio RPC self-test (native_sim only)"
     depends on ZMK_WATCHDOG_STUDIO_RPC
     help
-      Adds test-only init logic exercising src/studio/watchdog_handler.c's
-      GetStatus/ListIncidents/DeleteIncidents handlers directly (no
-      transport). Built separately from CONFIG_ZMK_WATCHDOG_TEST because it
-      needs CONFIG_ZMK_STUDIO, which in turn needs a physical-layout
-      devicetree (see tests/studio/ vs tests/watchdog/). Not for production
-      builds.
+      Adds test-only init logic exercising the GetStatus/ListIncidents/
+      DeleteIncidents handlers directly, without a transport. Separate from
+      CONFIG_ZMK_WATCHDOG_TEST because ZMK_STUDIO needs a physical-layout
+      devicetree. Not for production builds.
 
 endif
+
+config ZMK_WATCHDOG_FORK_LOG_LEVEL
+    int "zmk-watchdog-fork log level (0 off, 1 error, 2 warning, 3 info, 4 debug)"
+    range 0 4
+    default 3
+    help
+      Logs contain operational state and numeric diagnostics, never input
+      contents, user labels, peer addresses or authentication material.

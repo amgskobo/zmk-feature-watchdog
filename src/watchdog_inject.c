@@ -11,10 +11,9 @@
 /*
  * Dangerous test/fault injection helpers, gated behind
  * CONFIG_ZMK_WATCHDOG_TEST_INJECTION (default n). These deliberately break
- * the firmware to validate the freeze/fatal detectors end-to-end (native_sim
- * unit tests, hardware bring-up). No RPC is wired to these yet -- a later
- * phase adds request plumbing; for now these are plain C functions a test or
- * a temporary debug hook can call directly. See DESIGN.md SS4.4.
+ * the firmware to validate the freeze/fatal detectors. Tests can call them
+ * directly; enabled Studio RPC routes InjectTest through the shared executor.
+ * Injection defaults off in production. See DESIGN.md, Capture and monitoring.
  */
 
 static void inject_freeze_work_handler(struct k_work *work) {

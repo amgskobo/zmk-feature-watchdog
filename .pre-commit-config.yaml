@@ -6,7 +6,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: '(\.snapshot$|events\.patterns$)'
       - id: end-of-file-fixer
+        exclude: '(\.snapshot$|events\.patterns$)'
       - id: check-yaml
       - id: check-added-large-files
       - id: check-merge-conflict
@@ -16,7 +18,7 @@ repos:
     rev: v4.0.0-alpha.8
     hooks:
       - id: prettier
-        files: ^web/
+        files: ^(web/|tests/web/)
         types_or: [javascript, jsx, ts, tsx, json, css, html]
         additional_dependencies:
           - prettier@3.7.4
@@ -28,7 +30,7 @@ repos:
         name: eslint
         entry: bash -c 'cd web && npm run lint'
         language: system
-        files: ^web/.*\.(js|jsx|ts|tsx)$
+        files: ^(web/|tests/web/).*\.(js|jsx|ts|tsx)$
         pass_filenames: false
 
   # Web code: Jest tests
@@ -36,9 +38,9 @@ repos:
     hooks:
       - id: jest
         name: jest tests
-        entry: bash -c 'cd web && npm test'
+        entry: bash tests/run-web.sh
         language: system
-        files: ^web/
+        files: ^(web/|tests/web/)
         pass_filenames: false
 
   # Web code: Build
@@ -48,7 +50,7 @@ repos:
         name: web build
         entry: bash -c 'cd web && npm run build'
         language: system
-        files: ^web/
+        files: ^(web/|tests/web/)
         pass_filenames: false
 
   # ZMK module: Python tests
@@ -56,16 +58,16 @@ repos:
     hooks:
       - id: zmk-module-test
         name: zmk module tests
-        entry: python3 -m unittest -v
+        entry: python3 -m unittest discover -v -s tests -p test_owner.py
         language: system
-        files: ^(src/|include/|tests/|CMakeLists\.txt|Kconfig|test\.py|west\.yml|west/|boards/|dts/|snippets/|zephyr/)
+        files: ^(src/|include/|tests/(?!web/)|CMakeLists\.txt|Kconfig|west\.yml|west/|boards/|dts/|snippets/|zephyr/)
         pass_filenames: false
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: 75ca4ad908dc4a99f57921f29b7e6c1521e10b26
     hooks:
       - id: clang-format
         name: clang-format
-        files: \.(c|h|proto)$
+        files: \.(c|h|inc|proto)$
         additional_dependencies: [clang-format==21.1.8]
   # Lint for test script
   - repo: https://github.com/astral-sh/ruff-pre-commit

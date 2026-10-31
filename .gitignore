@@ -9,3 +9,11 @@ _codeql_detected_source_root
 .west
 *.local.json
 .claude/worktrees
+
+# Private development and deployment configuration
+.env
+.env.*
+!.env.example
+node_modules/
+web/dist/
+owner-test-output/
