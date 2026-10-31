@@ -5,20 +5,31 @@
 cormoran.watchdog.ErrorResponse.message           max_size:64
 
 cormoran.watchdog.FreezeDetail.queue_name         max_size:16
+cormoran.watchdog.FreezeDetail.trace              max_size:36
 cormoran.watchdog.FatalDetail.thread_name         max_size:16
 
-# Pagination: at most 4 incidents per ListIncidents response
-# (WATCHDOG_RPC_PAGE_SIZE in src/studio/watchdog_request_exec.c must match).
-# Chosen purely for UX -- the split relay path (src/split/watchdog_relay.c)
-# streams one incident per relay event (DESIGN.md SS7.1) instead of
-# embedding a whole page in one relay event, so this is no longer
-# constrained by the split relay transport's 255-byte hard ceiling or by
-# CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE (DESIGN.md SS7.2 -- that transport is a
-# genuine streaming ring buffer and never needs a whole response to fit in
-# one buffer either).
+# Pagination: at most 4 incidents per ListIncidents response; the firmware
+# page size and the central's page accumulator follow this count. Chosen for
+# UX only: the split relay streams one incident per relay event and the Studio
+# TX path is a streaming ring buffer, so neither limits it.
 cormoran.watchdog.IncidentPageResponse.incidents  max_count:4
 
 # Delete-by-id batch size: generous enough to delete a handful of incidents
 # in one call without needing repeated round-trips; still small relative to
 # CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS default (16).
 cormoran.watchdog.DeleteIncidentsRequest.ids       max_count:16
+
+cormoran.watchdog.FatalDetail.context max_size:24
+cormoran.watchdog.Incident.diagnostics max_size:80
+cormoran.watchdog.Incident.capture_context max_size:192
+cormoran.watchdog.RelayContextChunk.data max_size:64
+cormoran.watchdog.RelayDiagnosticChunk.diagnostics max_size:80
+cormoran.watchdog.StatusResponse.previous_diagnostics max_size:80
+# Public store capacity/count are uint16_t; keep their true encoded bounds
+# so the status + existing relay header still fits the 128-byte event.
+cormoran.watchdog.StatusResponse.capacity int_size:IS_16
+cormoran.watchdog.StatusResponse.stored int_size:IS_16
+cormoran.watchdog.Incident.capture_flags int_size:IS_8
+cormoran.watchdog.RelayIncidentCore.capture_flags int_size:IS_8
+cormoran.watchdog.RelayIncidentChunk.page_index int_size:IS_8
+cormoran.watchdog.RelayIncidentChunk.expected_count int_size:IS_8

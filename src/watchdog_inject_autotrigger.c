@@ -10,7 +10,11 @@
 
 #include <cormoran/zmk/watchdog.h>
 
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+#ifndef CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL
+#define CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL 3
+#endif
+LOG_MODULE_REGISTER(zmk_watchdog_fork_watchdog_inject_autotrigger,
+                    CONFIG_ZMK_WATCHDOG_FORK_LOG_LEVEL);
 
 /*
  * Boot-delay auto-trigger for CONFIG_ZMK_WATCHDOG_TEST_INJECTION (DESIGN.md

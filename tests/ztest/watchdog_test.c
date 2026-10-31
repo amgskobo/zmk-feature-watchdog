@@ -1,3 +1,4 @@
+#include "../support/init_result.h"
 /*
  * Copyright (c) 2026 cormoran
  *
@@ -20,7 +21,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
  * Minimal in-RAM settings backend, modeled on
- * zmk-feature-custom-settings/src/test/custom_settings_test.c. native_sim
+ * zmk-feature-custom-settings/tests/ztest/custom_settings_test.c. native_sim
  * has no real flash-backed settings destination registered by default, so
  * the store's settings_save_one()/settings_delete() calls need *some*
  * registered store to land in, and settings_load_subtree() needs a source
@@ -32,7 +33,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 struct test_settings_record {
     bool present;
     char name[SETTINGS_MAX_NAME_LEN];
-    uint8_t data[64];
+    uint8_t data[sizeof(struct zmk_watchdog_incident_record) + 4];
     size_t len;
 };
 
@@ -128,7 +129,7 @@ static int test_settings_backend_init(void) {
     }
     settings_src_register(&test_settings_store);
     settings_dst_register(&test_settings_store);
-    return 0;
+    return settings_load_subtree("wdg");
 }
 
 /* --------------------------------------------------------------------
@@ -465,6 +466,7 @@ static int test_freeze_detect(void) {
      * run-test.sh's harness (which only inspects piped stdout, not this
      * process's exit code) sees the PASS line and terminates cleanly.
      */
+    printk("OWNER_TEST_RESULT watchdog_test_init=0\n");
     exit(0);
 }
 
@@ -632,4 +634,4 @@ static int watchdog_test_init(void) {
  * in a real boot (irrelevant here since the test calls
  * zmk_watchdog_pending_convert() directly instead of waiting for it), and
  * after the settings subsystem's own SYS_INIT hooks. */
-SYS_INIT(watchdog_test_init, APPLICATION, 99);
+OWNER_CHECKED_SYS_INIT(watchdog_test_init, APPLICATION, 99);

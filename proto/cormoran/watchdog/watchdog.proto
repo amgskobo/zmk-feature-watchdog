@@ -14,6 +14,11 @@ enum IncidentType {
 message FreezeDetail {
     uint32 channel_id = 1;
     string queue_name = 2;
+    // Optional bounded trace, DESIGN.md, Cortex-M trace. Empty on older firmware
+    // and legacy records. Format 1 is exactly 36 bytes: format/state/flags/
+    // count, then LE u32 wait queue, SP and six code addresses. Addresses
+    // are a saved/interrupted PC and return-address candidates, not an unwind.
+    bytes trace = 3;
 }
 
 // Mirrors struct zmk_watchdog_incident_fatal_detail.
@@ -22,6 +27,8 @@ message FatalDetail {
     uint32 pc = 2;
     uint32 lr = 3;
     string thread_name = 4;
+    // Six LE u32 words: r0-r3, r12, xPSR. Empty when no Cortex-M ESF.
+    bytes context = 5;
 }
 
 // Mirrors struct zmk_watchdog_incident_reset_detail.
@@ -29,7 +36,7 @@ message ResetDetail { uint32 cause_bits = 1; }
 
 // A single incident, sourced either locally (source == 0, this device) or
 // relayed from a split peripheral (source == peripheral slot + 1, see
-// DESIGN.md SS7).
+// DESIGN.md, Studio RPC, split relay and client).
 message Incident {
     uint32 id = 1;
     uint32 source = 2;
@@ -41,13 +48,38 @@ message Incident {
         FatalDetail fatal = 7;
         ResetDetail reset = 8;
     }
+    // Format 1, 80 bytes. Fixed bounded breadcrumbs and cached state.
+    // See DESIGN.md, Operation diagnostics and build identity.
+    bytes diagnostics = 9;
+    // Bit 1: only a minimal explanation was committed; uptime/context may be unavailable.
+    // Bit 2: common capture extension is present. Other bits are reserved.
+    // Empty/zero on old firmware and complete captures without the extension.
+    uint32 capture_flags = 10;
+    // Common CPU/operation evidence. Format 1 is 192 bytes; see DESIGN.md.
+    // Additive: legacy incidents have no extension.
+    bytes capture_context = 11;
+}
+
+// Wire-compatible core; extensions travel separately to retain the 128-byte relay bound.
+message RelayIncidentCore {
+    uint32 id = 1;
+    uint32 source = 2;
+    IncidentType type = 3;
+    uint32 boot_ordinal = 4;
+    uint32 uptime_s = 5;
+    oneof detail {
+        FreezeDetail freeze = 6;
+        FatalDetail fatal = 7;
+        ResetDetail reset = 8;
+    }
+    uint32 capture_flags = 10;
 }
 
 // Request current status (capacity/stored/dropped/recording_stopped).
 // `source` selects which half answers: 0 = local/central (answered
 // synchronously); N>0 = split peripheral slot N, relayed over
-// CONFIG_ZMK_SPLIT_RELAY_EVENT (see DESIGN.md SS7) -- the reply arrives as a
-// PeripheralResponse Notification instead of a synchronous Response.
+// CONFIG_ZMK_SPLIT_RELAY_EVENT (see DESIGN.md, Studio RPC, split relay and client) -- the reply
+// arrives as a PeripheralResponse Notification instead of a synchronous Response.
 message GetStatusRequest { uint32 source = 1; }
 
 // Paginated incident listing. start_index is 0-based over the store's
@@ -71,14 +103,14 @@ message DeleteIncidentsRequest {
 // honored when the firmware was built with
 // CONFIG_ZMK_WATCHDOG_TEST_INJECTION=y -- otherwise InjectTestRequest is
 // answered with an ErrorResponse, same as any other unsupported request (see
-// DESIGN.md SS4.4).
+// DESIGN.md, Capture and monitoring).
 enum InjectTestKind {
     FREEZE_KIND = 0;
     FATAL_KIND = 1;
 }
 
 // Deliberately triggers the freeze or fatal detector, for hardware
-// validation (DESIGN.md SS4.4/SS12). Dangerous: only wired up when
+// validation (DESIGN.md, Capture and monitoring). Dangerous: only wired up when
 // CONFIG_ZMK_WATCHDOG_TEST_INJECTION=y.
 //   - kind=FREEZE_KIND: zmk_watchdog_inject_freeze() submits a k_work to the
 //     system workqueue and returns immediately -- the actual freeze (and
@@ -92,6 +124,10 @@ enum InjectTestKind {
 message InjectTestRequest { InjectTestKind kind = 1; }
 
 message Request {
+    // 5 was the retired GetHealth measurement request. An old client's request
+    // decodes as no request and is answered like any unsupported request.
+    reserved 5;
+    reserved "get_health";
     oneof request_type {
         GetStatusRequest get_status = 1;
         ListIncidentsRequest list_incidents = 2;
@@ -109,12 +145,21 @@ message StatusResponse {
     uint32 stored = 2;
     uint32 dropped_since_boot = 3;
     bool recording_stopped = 4;
+    // Current running build, independent of old stored incidents. 0 without metadata.
+    fixed32 build_tag = 5;
+    // DESIGN.md, Live runtime flags: supported/enabled/armed/failed/retention bits.
+    fixed32 runtime_flags = 6;
+    // Captured before the normal reset audit clears the driver's sticky bits.
+    fixed32 reset_cause = 7;
+    // Last completed checkpoint from before this boot, not a crash diagnosis.
+    // Empty on old firmware, power loss, or when no valid retained slot exists.
+    bytes previous_diagnostics = 8;
 }
 
 // At most WATCHDOG_RPC_PAGE_SIZE incidents per page (see
 // src/studio/watchdog_request_exec.c and watchdog.options' max_count on
 // `incidents` below) -- purely a UX choice now that the split relay path
-// streams one incident per relay event (DESIGN.md SS7.1) instead of
+// streams one incident per relay event (DESIGN.md, Studio RPC, split relay and client) instead of
 // embedding a whole page in one relay event.
 message IncidentPageResponse {
     repeated Incident incidents = 1;
@@ -135,7 +180,7 @@ message InjectAckResponse { InjectTestKind kind = 1; }
 // CONFIG_ZMK_SPLIT_RELAY_EVENT is inherently asynchronous -- it cannot fit
 // the Studio RPC call/response model). The real Response for this
 // `request_id` arrives later as a PeripheralResponse Notification. See
-// DESIGN.md SS7.
+// DESIGN.md, Studio RPC, split relay and client.
 message DeferredResponse { uint32 request_id = 1; }
 
 message Response {
@@ -147,16 +192,19 @@ message Response {
         DeferredResponse deferred = 5;
         InjectAckResponse inject_ack = 6;
     }
+    // 7 was the retired HealthResponse.
+    reserved 7;
+    reserved "health";
 }
 
 // Pushed unsolicited (raise_zmk_studio_custom_notification) when a new
 // incident is persisted, so the web UI can show it live without polling.
-// See DESIGN.md SS8.
+// See DESIGN.md, Studio RPC, split relay and client.
 message IncidentRecordedNotification { Incident incident = 1; }
 
 // The real response to a request that returned a DeferredResponse, once the
 // targeted peripheral's answer has relayed back to the central. Matches
-// pmw3610's PeripheralResponse pattern (src/split/watchdog_relay.c).
+// pmw3610's PeripheralResponse pattern (src/split/watchdog_relay_central.c).
 message PeripheralResponse {
     // Matches the source given in the original request (1 = first
     // peripheral, etc; never 0 -- local requests are answered synchronously
@@ -176,7 +224,7 @@ message Notification {
 // Wire format for relaying a Request to a split peripheral and its Response
 // back, carried as the opaque payload of this module's own
 // zmk_watchdog_relay_request/zmk_watchdog_relay_response ZMK split relay
-// events (see src/split/watchdog_relay.c) -- NOT part of the Request/Response
+// events (see src/split/watchdog_relay_events.h) -- NOT part of the Request/Response
 // oneofs above, and never sent directly over the Studio RPC transport.
 message RelayRequest {
     uint32 request_id = 1;
@@ -184,7 +232,7 @@ message RelayRequest {
 }
 
 // One incident of a ListIncidents answer, streamed as its own relay event
-// (DESIGN.md SS7.1) so a RelayResponse never has to embed a whole
+// (DESIGN.md, Studio RPC, split relay and client) so a RelayResponse never has to embed a whole
 // multi-incident IncidentPageResponse (which would force
 // CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN above its 128-byte default). The
 // peripheral responder raises one of these per incident in the local page,
@@ -195,7 +243,14 @@ message RelayIncidentChunk {
     bool done = 1;
     uint32 total = 2;
     uint32 start_index = 3;
-    Incident incident = 4;
+    RelayIncidentCore incident = 4;
+    optional uint32 page_index = 5;
+    optional uint32 expected_count = 6;
+    bool diagnostics_expected = 7;
+    // Incident.capture_flags bit 2 requires the common context fragments.
+    // Keep this redundant field unused so the static event fits 128 bytes.
+    reserved 8;
+    reserved "context_expected";
 }
 
 // The non-paginated Response variants a peripheral can produce for a
@@ -211,9 +266,9 @@ message RelayIncidentChunk {
 // hold WATCHDOG_RPC_PAGE_SIZE incidents) would make a single RelayResponse's
 // static encoded-size bound exceed the split relay transport's 255-byte
 // hard ceiling even though an incident_page is never actually placed here
-// at runtime -- exactly the blowup this whole redesign (DESIGN.md SS7.1)
-// exists to avoid. Field numbers/semantics mirror Response's, so converting
-// between the two is a straight copy.
+// at runtime -- exactly the blowup this whole redesign (DESIGN.md, Studio RPC, split relay and
+// client) exists to avoid. Field numbers/semantics mirror Response's, so converting between the two
+// is a straight copy.
 message RelayNonListResponse {
     oneof relay_non_list_response_type {
         ErrorResponse error = 1;
@@ -221,6 +276,9 @@ message RelayNonListResponse {
         DeleteResultResponse delete_result = 4;
         InjectAckResponse inject_ack = 6;
     }
+    // 7 was the retired HealthResponse.
+    reserved 7;
+    reserved "health";
 }
 
 // RelayResponse is a oneof: `response` is used for GetStatus/
@@ -234,5 +292,23 @@ message RelayResponse {
     oneof relay_response_type {
         RelayNonListResponse response = 2;
         RelayIncidentChunk incident_chunk = 3;
+        RelayDiagnosticChunk diagnostic_chunk = 4;
+        RelayContextChunk context_chunk = 5;
     }
+}
+
+// Ordered after its core and before done; page index disambiguates duplicate legacy IDs.
+message RelayDiagnosticChunk {
+    uint32 page_index = 1;
+    uint32 incident_id = 2;
+    bytes diagnostics = 3;
+}
+
+// Three ordered 64-byte fragments follow their incident core. Never increase
+// the split event payload bound. Index and ID disambiguate legacy duplicate IDs.
+message RelayContextChunk {
+    uint32 page_index = 1;
+    uint32 incident_id = 2;
+    uint32 fragment_index = 3;
+    bytes data = 4;
 }

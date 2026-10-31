@@ -1,0 +1,41 @@
+[
+    {
+        "configs":  [
+                        "CONFIG_ZMK_WATCHDOG_TEST"
+                    ],
+        "fixtures":  [
+                         "watchdog"
+                     ],
+        "hook":  "watchdog_test_init"
+    },
+    {
+        "configs":  [
+                        "CONFIG_ZMK_WATCHDOG_STUDIO_RPC_TEST"
+                    ],
+        "fixtures":  [
+                         "studio",
+                         "studio_unsecured"
+                     ],
+        "hook":  "watchdog_rpc_test_init"
+    },
+    {
+        "not_configs":  [
+                            "CONFIG_ZMK_SPLIT_ROLE_CENTRAL"
+                        ],
+        "configs":  [
+                        "CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST",
+                        "CONFIG_ZMK_SPLIT"
+                    ],
+        "fixtures":  [
+                         "split_peripheral"
+                     ],
+        "hook":  "watchdog_split_relay_test_init"
+    },
+    {
+        "configs":  [
+                        "CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST",
+                        "CONFIG_ZMK_SPLIT_ROLE_CENTRAL"
+                    ],
+        "hook":  "watchdog_split_relay_central_test_init"
+    }
+]

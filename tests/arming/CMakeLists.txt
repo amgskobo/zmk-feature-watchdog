@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(watchdog_arming)
+target_sources(app PRIVATE main.c ../../src/watchdog_freeze.c ../../src/watchdog_trace.c ../../src/watchdog_capture.c "${ZMK_ROOT}/app/src/workqueue.c")
+target_include_directories(app PRIVATE ../../include "${ZMK_ROOT}/app/include")
+target_compile_definitions(app PRIVATE CONFIG_ZMK_LOG_LEVEL=0 CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS=100 CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE=2048 CONFIG_ZMK_LOW_PRIORITY_THREAD_PRIORITY=10)

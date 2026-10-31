@@ -1,3 +1,4 @@
+#include "../support/init_result.h"
 /*
  * Copyright (c) 2026 cormoran
  *
@@ -14,12 +15,16 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/byteorder.h>
 
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <zmk/studio/core.h>
 #include <zmk/studio/custom.h>
 #include <cormoran/watchdog/watchdog.pb.h>
 #include <cormoran/zmk/watchdog.h>
+#include <cormoran/zmk/watchdog_request_exec.h>
+#include <cormoran/zmk/watchdog_diagnostics.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -36,7 +41,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 struct test_settings_record {
     bool present;
     char name[SETTINGS_MAX_NAME_LEN];
-    uint8_t data[64];
+    uint8_t data[sizeof(struct zmk_watchdog_incident_record) + 4];
     size_t len;
 };
 
@@ -132,7 +137,7 @@ static int test_settings_backend_init(void) {
     }
     settings_src_register(&test_settings_store);
     settings_dst_register(&test_settings_store);
-    return 0;
+    return settings_load_subtree("wdg");
 }
 
 /*
@@ -169,7 +174,9 @@ static custom_subsystem_handler *find_watchdog_rpc_handler(void) {
  * the remaining raw bytes of this submessage into a fixed test buffer, the
  * standard nanopb pattern for decoding a callback-typed bytes field. */
 struct call_response_payload_capture {
-    uint8_t buf[CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE + 16];
+    /* Collect a whole wire message here; the production TX ring streams it
+     * in smaller pieces and does not bound the total encoded message size. */
+    uint8_t buf[MAX(cormoran_watchdog_Response_size, cormoran_watchdog_Notification_size) + 16];
     size_t size;
 };
 
@@ -223,7 +230,7 @@ static bool call_watchdog_rpc(const cormoran_watchdog_Request *req,
         return false;
     }
 
-    static uint8_t call_resp_buf[CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE + 16];
+    static uint8_t call_resp_buf[cormoran_watchdog_Response_size + 16];
     pb_ostream_t call_resp_stream = pb_ostream_from_buffer(call_resp_buf, sizeof(call_resp_buf));
     if (!pb_encode(&call_resp_stream, zmk_custom_CallResponse_fields, &response)) {
         LOG_ERR("Failed to encode CallResponse: %s", PB_GET_ERROR(&call_resp_stream));
@@ -254,6 +261,128 @@ static bool call_watchdog_rpc(const cormoran_watchdog_Request *req,
     return true;
 }
 
+/* Encode during event dispatch, while the production buffer remains valid.
+ * Locking here models waiting for the transport before payload encoding. */
+static bool notification_probe_active, notification_probe_lock_before_encode;
+static bool notification_probe_lock_after_sizing, notification_probe_frame_valid;
+static unsigned int notification_probe_events;
+static bool notification_probe_encoded;
+static cormoran_watchdog_Notification notification_probe_decoded;
+
+static int notification_probe_listener(const zmk_event_t *eh) {
+    const struct zmk_studio_custom_notification *event = as_zmk_studio_custom_notification(eh);
+    if (!notification_probe_active || !event) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    size_t count;
+    STRUCT_SECTION_COUNT(zmk_rpc_custom_subsystem, &count);
+    if (event->subsystem_index >= count) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    struct zmk_rpc_custom_subsystem *subsystem;
+    STRUCT_SECTION_GET(zmk_rpc_custom_subsystem, event->subsystem_index, &subsystem);
+    if (strcmp(subsystem->identifier, "cormoran__watchdog") != 0) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    notification_probe_events++;
+    if (notification_probe_lock_before_encode) {
+        zmk_studio_core_lock();
+    }
+    zmk_custom_CallResponse response = zmk_custom_CallResponse_init_zero;
+    response.payload = event->encode_payload;
+    uint8_t bytes[cormoran_watchdog_Notification_size + 16];
+    pb_ostream_t output = pb_ostream_from_buffer(bytes, sizeof(bytes));
+    size_t expected_size;
+    notification_probe_frame_valid =
+        pb_get_encoded_size(&expected_size, zmk_custom_CallResponse_fields, &response);
+    if (notification_probe_lock_after_sizing) {
+        zmk_studio_core_lock();
+    }
+    notification_probe_frame_valid =
+        notification_probe_frame_valid &&
+        pb_encode(&output, zmk_custom_CallResponse_fields, &response) &&
+        output.bytes_written == expected_size;
+    notification_probe_encoded = false;
+    if (notification_probe_frame_valid) {
+        struct call_response_payload_capture capture = {0};
+        zmk_custom_CallResponse envelope = zmk_custom_CallResponse_init_zero;
+        envelope.payload.funcs.decode = decode_call_response_payload;
+        envelope.payload.arg = &capture;
+        pb_istream_t input = pb_istream_from_buffer(bytes, output.bytes_written);
+        notification_probe_frame_valid =
+            pb_decode(&input, zmk_custom_CallResponse_fields, &envelope);
+        notification_probe_decoded =
+            (cormoran_watchdog_Notification)cormoran_watchdog_Notification_init_zero;
+        input = pb_istream_from_buffer(capture.buf, capture.size);
+        notification_probe_encoded =
+            notification_probe_frame_valid && capture.size > 0 &&
+            pb_decode(&input, cormoran_watchdog_Notification_fields, &notification_probe_decoded);
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(watchdog_notification_probe, notification_probe_listener);
+ZMK_SUBSCRIPTION(watchdog_notification_probe, zmk_studio_custom_notification);
+
+static int test_notification_authorization(void) {
+    const bool unsecured = IS_ENABLED(CONFIG_ZMK_WATCHDOG_STUDIO_RPC_UNSECURED);
+    struct zmk_watchdog_incident_record record = {0};
+    record.type = ZMK_WATCHDOG_INCIDENT_FATAL;
+    record.uptime_s = 42;
+    record.detail.fatal.pc = 0x1020;
+    notification_probe_active = true;
+    zmk_studio_core_lock();
+    notification_probe_events = 0;
+    notification_probe_encoded = false;
+    notification_probe_frame_valid = false;
+    if (zmk_watchdog_store_append(&record) != 0 || zmk_watchdog_store_count() != 1 ||
+        notification_probe_events != (unsigned int)unsecured ||
+        notification_probe_encoded != unsecured || notification_probe_frame_valid != unsecured) {
+        return -EINVAL;
+    }
+
+    zmk_studio_core_unlock();
+    notification_probe_events = 0;
+    notification_probe_encoded = false;
+    if (zmk_watchdog_store_append(&record) != 0 || notification_probe_events != 1 ||
+        !notification_probe_encoded || !notification_probe_frame_valid ||
+        notification_probe_decoded.which_notification_type !=
+            cormoran_watchdog_Notification_incident_recorded_tag ||
+        !notification_probe_decoded.notification_type.incident_recorded.has_incident ||
+        notification_probe_decoded.notification_type.incident_recorded.incident.uptime_s != 42 ||
+        notification_probe_decoded.notification_type.incident_recorded.incident.detail.fatal.pc !=
+            0x1020) {
+        return -EINVAL;
+    }
+
+    notification_probe_lock_before_encode = true;
+    notification_probe_events = 0;
+    notification_probe_encoded = false;
+    if (zmk_watchdog_store_append(&record) != 0 || notification_probe_events != 1 ||
+        !notification_probe_frame_valid || notification_probe_encoded != unsecured ||
+        zmk_watchdog_store_count() != 3) {
+        return -EINVAL;
+    }
+    notification_probe_lock_before_encode = false;
+    zmk_studio_core_unlock();
+    notification_probe_lock_after_sizing = true;
+    notification_probe_events = 0;
+    if (zmk_watchdog_store_append(&record) != 0 || notification_probe_events != 1 ||
+        !notification_probe_frame_valid || !notification_probe_encoded ||
+        zmk_watchdog_store_count() != 4) {
+        return -EINVAL;
+    }
+    notification_probe_lock_after_sizing = false;
+    zmk_studio_core_unlock();
+    if (notification_probe_events != 1) {
+        return -EINVAL;
+    }
+    notification_probe_active = false;
+    zmk_studio_core_lock();
+    LOG_INF("PASS: watchdog_notification_authorization unsecured=%d", unsecured);
+    return zmk_watchdog_store_delete_all();
+}
+
 static int test_rpc_get_status_empty_store(void) {
     cormoran_watchdog_Request req = cormoran_watchdog_Request_init_zero;
     req.which_request_type = cormoran_watchdog_Request_get_status_tag;
@@ -277,8 +406,54 @@ static int test_rpc_get_status_empty_store(void) {
         LOG_ERR("status.capacity mismatch");
         return -EINVAL;
     }
+    if (resp.response_type.status.build_tag != zmk_watchdog_diagnostics_build_tag() ||
+        resp.response_type.status.runtime_flags != zmk_watchdog_diagnostics_runtime_flags()) {
+        LOG_ERR("runtime metadata differs from running firmware");
+        return -EINVAL;
+    }
 
     LOG_INF("PASS: watchdog_rpc_get_status_empty_store");
+    return 0;
+}
+
+static int test_runtime_status_relay_bound(void) {
+    cormoran_watchdog_RelayResponse relay = cormoran_watchdog_RelayResponse_init_zero;
+    relay.request_id = UINT32_MAX;
+    relay.which_relay_response_type = cormoran_watchdog_RelayResponse_response_tag;
+    relay.relay_response_type.response.which_relay_non_list_response_type =
+        cormoran_watchdog_RelayNonListResponse_status_tag;
+    cormoran_watchdog_StatusResponse *status =
+        &relay.relay_response_type.response.relay_non_list_response_type.status;
+    status->capacity = UINT16_MAX;
+    status->stored = UINT16_MAX;
+    status->dropped_since_boot = UINT32_MAX;
+    status->recording_stopped = true;
+    status->build_tag = status->runtime_flags = status->reset_cause = UINT32_MAX;
+    status->previous_diagnostics.size = 80;
+    for (size_t i = 0; i < 80; ++i) {
+        status->previous_diagnostics.bytes[i] = (uint8_t)i;
+    }
+    uint8_t bytes[124]; /* payload plus source/size/alignment must fit 128 */
+    pb_ostream_t stream = pb_ostream_from_buffer(bytes, sizeof(bytes));
+    if (!pb_encode(&stream, cormoran_watchdog_RelayResponse_fields, &relay) ||
+        stream.bytes_written > 124 || cormoran_watchdog_RelayResponse_size > 124) {
+        LOG_ERR("status relay exceeds existing split event bound");
+        return -EINVAL;
+    }
+    cormoran_watchdog_RelayResponse decoded = cormoran_watchdog_RelayResponse_init_zero;
+    pb_istream_t input = pb_istream_from_buffer(bytes, stream.bytes_written);
+    if (!pb_decode(&input, cormoran_watchdog_RelayResponse_fields, &decoded)) {
+        return -EINVAL;
+    }
+    const cormoran_watchdog_StatusResponse *got =
+        &decoded.relay_response_type.response.relay_non_list_response_type.status;
+    if (got->capacity != UINT16_MAX || got->stored != UINT16_MAX ||
+        got->dropped_since_boot != UINT32_MAX || got->runtime_flags != UINT32_MAX ||
+        got->reset_cause != UINT32_MAX || got->previous_diagnostics.size != 80 ||
+        memcmp(got->previous_diagnostics.bytes, status->previous_diagnostics.bytes, 80)) {
+        return -EINVAL;
+    }
+    LOG_INF("PASS: watchdog_runtime_status_relay_bound");
     return 0;
 }
 
@@ -311,15 +486,20 @@ static int test_rpc_list_incidents_empty_store(void) {
 static int test_rpc_list_incidents_pagination_and_delete(void) {
     /* Populate: one of each incident type, plus enough extras to force two
      * pages (page size is 4, see WATCHDOG_RPC_PAGE_SIZE in
-     * src/studio/watchdog_request_exec.c -- a pure UX choice since
-     * DESIGN.md SS7.1: the split relay path streams one incident per relay
-     * event rather than embedding a whole page in one relay event, so this
-     * is no longer constrained by the split relay transport's 255-byte
-     * hard ceiling). */
+     * src/studio/watchdog_request_exec.c). The split relay streams one incident
+     * per event, so the local page size is independent of its 255-byte ceiling
+     * (see DESIGN.md, Studio RPC, split relay and client). */
     struct zmk_watchdog_incident_record freeze_rec = {0};
     freeze_rec.type = ZMK_WATCHDOG_INCIDENT_FREEZE;
     freeze_rec.uptime_s = 10;
     freeze_rec.detail.freeze.channel_id = 2;
+    freeze_rec.detail.freeze.thread_state = 2;
+    freeze_rec.detail.freeze.trace_flags = ZMK_WATCHDOG_TRACE_FRAME | ZMK_WATCHDOG_TRACE_PENDED;
+    freeze_rec.detail.freeze.trace_count = 2;
+    freeze_rec.detail.freeze.wait_queue = 0x20000124;
+    freeze_rec.detail.freeze.stack_pointer = 0x20001000;
+    freeze_rec.detail.freeze.addresses[0] = 0x1020;
+    freeze_rec.detail.freeze.addresses[1] = 0x2031;
     strncpy(freeze_rec.detail.freeze.queue_name, "sysworkq",
             sizeof(freeze_rec.detail.freeze.queue_name) - 1);
     if (zmk_watchdog_store_append(&freeze_rec) != 0) {
@@ -329,6 +509,19 @@ static int test_rpc_list_incidents_pagination_and_delete(void) {
     struct zmk_watchdog_incident_record fatal_rec = {0};
     fatal_rec.type = ZMK_WATCHDOG_INCIDENT_FATAL;
     fatal_rec.uptime_s = 20;
+    fatal_rec.flags = 1;
+    fatal_rec.flags |= ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID;
+    fatal_rec.capture_context[0] = 1;
+    for (size_t i = 1; i < sizeof(fatal_rec.capture_context); ++i) {
+        fatal_rec.capture_context[i] = (uint8_t)i;
+    }
+    fatal_rec.diagnostics[0] = 1;
+    for (size_t i = 0; i < 6; ++i) {
+        fatal_rec.detail.fatal.context[i] = 0x10000000U + i;
+    }
+    for (size_t i = 1; i < sizeof(fatal_rec.diagnostics); ++i) {
+        fatal_rec.diagnostics[i] = (uint8_t)i;
+    }
     fatal_rec.detail.fatal.reason = 4;
     fatal_rec.detail.fatal.pc = 0x1000;
     fatal_rec.detail.fatal.lr = 0x2000;
@@ -389,6 +582,18 @@ static int test_rpc_list_incidents_pagination_and_delete(void) {
         return -EINVAL;
     }
 
+    const cormoran_watchdog_Incident *fatal_wire = &resp.response_type.incident_page.incidents[1];
+    if (fatal_wire->diagnostics.size != 80 || fatal_wire->detail.fatal.context.size != 24 ||
+        fatal_wire->capture_context.size != ZMK_WATCHDOG_CAPTURE_CONTEXT_SIZE ||
+        !(fatal_wire->capture_flags & ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID) ||
+        memcmp(fatal_wire->capture_context.bytes, fatal_rec.capture_context,
+               ZMK_WATCHDOG_CAPTURE_CONTEXT_SIZE) ||
+        memcmp(fatal_wire->diagnostics.bytes, fatal_rec.diagnostics, 80) ||
+        sys_get_le32(fatal_wire->detail.fatal.context.bytes + 20) != 0x10000005U) {
+        LOG_ERR("fatal context/diagnostic streaming mismatch");
+        return -EINVAL;
+    }
+
     /* Spot-check the first incident (freeze_rec): id assigned by the store,
      * source always 0 in this phase, detail decoded correctly. */
     const cormoran_watchdog_Incident *first = &resp.response_type.incident_page.incidents[0];
@@ -403,6 +608,16 @@ static int test_rpc_list_incidents_pagination_and_delete(void) {
     }
 
     const cormoran_watchdog_Incident *second = &resp.response_type.incident_page.incidents[1];
+    /* Independent wire fixture: little-endian metadata, ordered PC/caller,
+     * and all unused address slots zero; exercise real nanopb callbacks. */
+    const uint8_t expected_trace[36] = {
+        1, 2, 5, 2, 0x24, 1, 0, 0x20, 0, 0x10, 0, 0x20, 0x20, 0x10, 0, 0, 0x31, 0x20, 0, 0,
+    };
+    if (first->detail.freeze.trace.size != sizeof(expected_trace) ||
+        memcmp(first->detail.freeze.trace.bytes, expected_trace, sizeof(expected_trace)) != 0) {
+        LOG_ERR("freeze trace wire mismatch");
+        return -EINVAL;
+    }
     if (second->type != cormoran_watchdog_IncidentType_FATAL ||
         second->which_detail != cormoran_watchdog_Incident_fatal_tag ||
         second->detail.fatal.reason != 4 || second->detail.fatal.pc != 0x1000 ||
@@ -423,7 +638,8 @@ static int test_rpc_list_incidents_pagination_and_delete(void) {
     const cormoran_watchdog_Incident *fourth = &resp.response_type.incident_page.incidents[3];
     if (fourth->type != cormoran_watchdog_IncidentType_FREEZE ||
         fourth->which_detail != cormoran_watchdog_Incident_freeze_tag ||
-        strcmp(fourth->detail.freeze.queue_name, "lowprio_workq") != 0 || fourth->uptime_s != 40) {
+        strcmp(fourth->detail.freeze.queue_name, "lowprio_workq") != 0 || fourth->uptime_s != 40 ||
+        fourth->detail.freeze.trace.size != 0) {
         LOG_ERR("fourth incident (extra freeze) mismatch");
         return -EINVAL;
     }
@@ -540,7 +756,7 @@ static int test_rpc_recording_stopped_status(void) {
 /*
  * InjectFreeze-via-RPC test (requires CONFIG_ZMK_WATCHDOG_TEST_INJECTION,
  * enabled in tests/studio/native_sim.conf). Mirrors tests/watchdog/'s
- * src/test/watchdog_test.c::test_freeze_detect(), but drives the injection
+ * tests/ztest/watchdog_test.c::test_freeze_detect(), but drives the injection
  * through the RPC handler (InjectTestRequest) instead of calling
  * zmk_watchdog_inject_freeze() directly -- exercising the exact path a real
  * Studio client would use (src/studio/watchdog_request_exec.c's
@@ -568,7 +784,7 @@ static int test_rpc_inject_freeze(void) {
 
     /* The RPC handler must respond with InjectAck *before* the freeze
      * actually happens (zmk_watchdog_inject_freeze() only submits a
-     * k_work and returns immediately -- see DESIGN.md SS4.4). */
+     * k_work and returns immediately -- see DESIGN.md, Studio RPC, split relay and client). */
     if (resp.which_response_type != cormoran_watchdog_Response_inject_ack_tag ||
         resp.response_type.inject_ack.kind != cormoran_watchdog_InjectTestKind_FREEZE_KIND) {
         LOG_ERR("expected InjectAck(FREEZE_KIND), got response type %d", resp.which_response_type);
@@ -585,7 +801,7 @@ static int test_rpc_inject_freeze(void) {
      * tests/studio/native_sim.conf specifically so this sleep is short. */
     k_sleep(K_MSEC(CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS * 2));
 
-    /* See src/test/watchdog_test.c::test_freeze_detect() for why the
+    /* See tests/ztest/watchdog_test.c::test_freeze_detect() for why the
      * "sysworkq" channel must be disarmed now, before restoring the real
      * zmk_watchdog_reboot(): the injected freeze work never returns, so
      * sysworkq stays permanently blocked and the channel would otherwise
@@ -626,6 +842,7 @@ static int test_rpc_inject_freeze(void) {
      * permanently wedged from here on, so end the process now rather than
      * letting the rest of the firmware hang trying to use it. This test
      * therefore runs last (see watchdog_rpc_test_init() below). */
+    printk("OWNER_TEST_RESULT watchdog_rpc_test_init=0\n");
     exit(0);
 }
 
@@ -646,13 +863,49 @@ static int test_rpc_inject_freeze(void) {
  * is ever acted on.
  */
 
+static int test_bounded_names_and_capture_flags(void) {
+    struct zmk_watchdog_incident_record rec;
+    memset(&rec, 'A', sizeof(rec)); /* No terminator anywhere in the input. */
+    rec.version = ZMK_WATCHDOG_RECORD_VERSION;
+    rec.type = ZMK_WATCHDOG_INCIDENT_FATAL;
+    rec.flags = ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
+    cormoran_watchdog_Incident out;
+    watchdog_incident_record_to_proto(7, 0, &rec, &out);
+    if (out.capture_flags != ZMK_WATCHDOG_CAPTURE_INCOMPLETE ||
+        strcmp(out.detail.fatal.thread_name, "AAAAAAAAAAAAAAA") ||
+        out.detail.fatal.context.size != 0) {
+        return -EINVAL;
+    }
+    rec.type = ZMK_WATCHDOG_INCIDENT_FREEZE;
+    watchdog_incident_record_to_proto(7, 0, &rec, &out);
+    if (strcmp(out.detail.freeze.queue_name, "AAAAAAAAAAAAAAA")) {
+        return -EINVAL;
+    }
+    LOG_INF("PASS: watchdog_rpc_bounded_names_and_minimal_flags");
+    return 0;
+}
+
 static int watchdog_rpc_test_init(void) {
+    if (test_bounded_names_and_capture_flags() < 0) {
+        return -EINVAL;
+    }
     int ret = test_settings_backend_init();
     if (ret < 0) {
         return ret;
     }
 
+    ret = test_notification_authorization();
+    if (ret < 0) {
+        LOG_ERR("watchdog notification authorization regression");
+        exit(1);
+    }
+
     ret = test_rpc_get_status_empty_store();
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = test_runtime_status_relay_bound();
     if (ret < 0) {
         return ret;
     }
@@ -694,4 +947,4 @@ static int watchdog_rpc_test_init(void) {
  * enough because settings_save_one()/settings_call_set_handler() only need
  * a registered store at call time, not at the store module's own init
  * time. */
-SYS_INIT(watchdog_rpc_test_init, APPLICATION, 99);
+OWNER_CHECKED_SYS_INIT(watchdog_rpc_test_init, APPLICATION, 99);

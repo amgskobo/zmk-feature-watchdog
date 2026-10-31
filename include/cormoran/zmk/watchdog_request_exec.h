@@ -3,20 +3,10 @@
 /**
  * @file watchdog_request_exec.h
  *
- * @brief Transport-independent execution of watchdog Request messages
- * against *this half's own local* incident store
- * (include/cormoran/zmk/watchdog.h), factored out of
- * src/studio/watchdog_handler.c so the exact same GetStatus/ListIncidents/
- * DeleteIncidents logic can be reused by:
- *  - the local Studio RPC handler (CONFIG_ZMK_WATCHDOG_STUDIO_RPC, central/
- *    non-split only, source == 0), and
- *  - the split relay peripheral responder (src/split/watchdog_relay.c,
- *    CONFIG_ZMK_WATCHDOG_SPLIT_RELAY, which a split peripheral -- with no
- *    Studio of its own -- also needs to answer a relayed request against
- *    its own store).
- *
- * Pattern copied from
- * zmk-driver-pmw3610-with-custom-studio-rpc/include/cormoran/pmw3610/pmw3610_request_exec.h.
+ * @brief Transport-independent execution of watchdog Request messages against
+ * this half's own incident store. Shared by the local Studio RPC handler
+ * (source 0) and the split relay peripheral responder, which answers a
+ * relayed request against its own store.
  */
 
 #include <stdbool.h>
@@ -29,35 +19,35 @@
 extern "C" {
 #endif
 
-/** @brief Converts a raw incident record + its store id into the wire
- * Incident message. `source` is stamped by the caller (0 for a local
- * request; the relaying peripheral's slot for a relayed one) -- this
- * function does not know or care which half it is running on. */
+/** Source routing shared by Studio and the relay. Injection is always local. */
+static inline uint32_t watchdog_request_source(const cormoran_watchdog_Request *req) {
+    switch (req->which_request_type) {
+    case cormoran_watchdog_Request_get_status_tag:
+        return req->request_type.get_status.source;
+    case cormoran_watchdog_Request_list_incidents_tag:
+        return req->request_type.list_incidents.source;
+    case cormoran_watchdog_Request_delete_incidents_tag:
+        return req->request_type.delete_incidents.source;
+    default:
+        return 0;
+    }
+}
+
+/** @brief Converts an incident record and its store id into the wire Incident.
+ * The caller stamps `source`: 0 for this half, the peripheral slot for a
+ * relayed answer. */
 void watchdog_incident_record_to_proto(uint16_t id, uint32_t source,
                                        const struct zmk_watchdog_incident_record *rec,
                                        cormoran_watchdog_Incident *out);
 
-/** @brief Executes `req` (one of GetStatus/ListIncidents/DeleteIncidents/
- * InjectTest) against this half's own local store and fills `resp`.
- * `req->source` (or the equivalent field per request kind) is ignored here --
- * the caller is responsible for routing a nonzero source to the relay
- * instead of calling this function directly (see
- * watchdog_relay_dispatch_request()). InjectTest has no `source` field at
- * all -- test/fault injection only ever targets *this* half, by design (see
- * DESIGN.md SS4.4): a peripheral has no Studio RPC of its own to receive an
- * on-demand injection request, so it uses the boot-delay auto-trigger
- * instead (src/watchdog_inject_autotrigger.c).
- *
- * InjectTestRequest is only honored when CONFIG_ZMK_WATCHDOG_TEST_INJECTION
- * is enabled; otherwise it falls through to the same ErrorResponse path as
- * any other unsupported request kind, so the proto wire format stays stable
- * across test-injection-enabled and disabled builds.
- *
- * Always fills *resp with something (a Status/IncidentPage/DeleteResult/
- * InjectAck on success, an ErrorResponse for an unset/unsupported request
- * kind) -- never returns without a usable response, matching this module's
- * "never crash on a bad request" style.
- */
+/** @brief Replaces `resp` with an ErrorResponse carrying `message`. */
+void watchdog_response_set_error(cormoran_watchdog_Response *resp, const char *message);
+
+/** @brief Executes `req` against this half's store and always fills `resp`:
+ * a Status/IncidentPage/DeleteResult/InjectAck, or an ErrorResponse for an
+ * unset or unsupported request kind. The request's `source` is ignored; the
+ * caller routes a nonzero source to the relay instead. InjectTest is honored
+ * only with CONFIG_ZMK_WATCHDOG_TEST_INJECTION and always targets this half. */
 void watchdog_request_exec_handle(const cormoran_watchdog_Request *req,
                                   cormoran_watchdog_Response *resp);
 
