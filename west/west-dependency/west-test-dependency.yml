@@ -8,11 +8,20 @@ manifest:
   projects:
     - name: zmk
       remote: cormoran
-      revision: main+custom-studio-protocol
+      revision: e5c9b6915b56801193e359dd9bad4a167ce0d1b8
       import:
         file: app/west.yml
       clone-depth: 1
     - name: zmk-west-commands
       remote: cormoran
-      revision: main
+      revision: 536260056f362edb2092905f2a75317bc8cb9bc2
       import: true
+    - name: zmk-feature-custom-settings
+      url: https://github.com/amgskobo/zmk-feature-custom-settings
+      revision: b91a8ceb0a57a0cf41b34270752d79463e2848fa
+    - name: zephyr
+      remote: zmkfirmware
+      revision: 10ba6d0cb38bc3d258775d27982f707599320085
+      clone-depth: 1
+      import:
+        name-blocklist: [ci-tools, hal_altera, hal_cypress, hal_infineon, hal_microchip, hal_nxp, hal_openisa, hal_xtensa, hal_st, hal_ti, loramac-node, mcuboot, mcumgr, net-tools, openthread, edtt, trusted-firmware-m]

@@ -18,6 +18,8 @@ on:
       - .codex/**
       - "LICENSE"
       - "web/**"
+      - "tests/web/**"
+      - "tests/run-web.sh"
   pull_request:
     paths-ignore:
       - "**/*.md"
@@ -33,34 +35,73 @@ on:
       - .codex/**
       - "LICENSE"
       - "web/**"
+      - "tests/web/**"
+      - "tests/run-web.sh"
   workflow_dispatch:
   schedule:
     # 20:00 JST every Friday (11:00 UTC)
     - cron: "0 11 * * 5"
 
 jobs:
+  test-static-checks:
+    name: Owner test static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+      - name: Install pinned checker
+        run: python -m pip install pre-commit==4.7.0
+      - name: Check owned tests and tools
+        env:
+          # Firmware and Web jobs execute these exact owner entry points.
+          SKIP: eslint,jest,web-build,zmk-module-test
+        run: git ls-files -z -- tests tools | xargs -0 -r pre-commit run --verbose --files
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      image: zmkfirmware/zmk-build-arm:stable
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
     name: Build
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Store behavior and failure recovery
+        run: bash tests/store/run.sh
       - uses: ./.github/actions/west-init
       - name: Test
-        run: python3 -m unittest -v
+        run: OWNER_TEST_OUTPUT="$PWD/owner-test-output" python3 -m unittest discover -v -s tests -p test_owner.py
       - name: Upload Build Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zmk-firmware
+          include-hidden-files: true
           path: |
-            build/*/zephyr/zmk.uf2
+            owner-test-output/**/*.uf2
+            owner-test-output/**/*.elf
+            !owner-test-output/**/zephyr_pre*.elf
+            owner-test-output/**/*.exe
+            owner-test-output/**/*.log
+            owner-test-output/**/*.diff
+            owner-test-output/**/*.json
+            owner-test-output/**/*.dts
+            owner-test-output/**/.config
+            owner-test-output/**/CMakeCache.txt
+            owner-test-output/**/zephyr_modules.txt
 
   keepalive:
     if: github.event_name == 'schedule'
-    permissions: write-all
+    # Re-enabling a workflow needs actions: write; the checkout reads the repository.
+    permissions:
+      actions: write
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

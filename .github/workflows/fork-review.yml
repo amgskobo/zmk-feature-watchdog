@@ -1,0 +1,71 @@
+name: Fork review
+
+on:
+  push:
+    branches: ["codex/watchdog-review"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  owner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
+      options: --cpus 3 --memory 6g
+    env:
+      ZMK_TEST_MODE: full
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      OWNER_TEST_BUILD_PARALLELISM: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare compiler and checker
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-multilib python3-venv
+          python3 -m venv /tmp/fork-review-checkers
+          /tmp/fork-review-checkers/bin/python -m pip install pre-commit==4.7.0
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: ./.github/actions/west-init
+      - name: Check owned tests and tools
+        if: ${{ hashFiles('.pre-commit-config.yaml') != '' }}
+        env:
+          SKIP: eslint,jest,web-build,zmk-module-test
+        run: git ls-files -z -- tests tools | xargs -0 -r /tmp/fork-review-checkers/bin/python -m pre_commit run --verbose --files
+      - name: Full store, mutation and decoder checks
+        run: |
+          bash tests/store/run.sh
+          WATCHDOG_MUTATION_ARTIFACTS="$PWD/mutation-output" python3 tests/store/mutate_overwrite.py
+          python3 -m unittest discover -v -s tests/decoder
+          python3 -m unittest discover -v -s tests -p test_retirement.py
+      - name: Complete owner firmware matrix
+        run: OWNER_TEST_OUTPUT="$PWD/owner-test-output" python3 -m unittest discover -v -s tests -p test_owner.py
+
+  web:
+    needs: owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
+      options: --cpus 3 --memory 6g
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.4"
+      - name: Prepare locked Web environment
+        working-directory: web
+        run: npm ci
+      - name: Complete owner Web selection
+        run: bash tests/run-web.sh
+      - name: Lint and production build
+        working-directory: web
+        run: |
+          npm run lint
+          npm run build
