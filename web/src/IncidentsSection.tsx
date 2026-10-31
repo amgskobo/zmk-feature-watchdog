@@ -1,4 +1,11 @@
-import { useContext, useEffect, useState, useCallback } from "react";
+import {
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  useMemo,
+} from "react";
 import {
   ZMKCustomSubsystem,
   ZMKAppContext,
@@ -8,14 +15,65 @@ import {
   Response,
   Incident,
   Notification,
+  StatusResponse,
 } from "./proto/cormoran/watchdog/watchdog";
 import {
   incidentDetailSummary,
   incidentTypeLabel,
   sourceLabel,
+  toHex,
 } from "./incidentHelpers";
+import { decodeFreezeTrace } from "./freezeTrace";
+import { DiagnosticDetail } from "./DiagnosticDetail";
+import { RuntimeDetail } from "./RuntimeDetail";
+import { CLIENT_REVISION } from "./reportFormat";
+import { callWithRelay } from "./relayRequest";
+import { serializeRpc } from "./serializedRpc";
 
 export const SUBSYSTEM_IDENTIFIER = "cormoran__watchdog";
+
+function TraceDetail({ incident }: { incident: Incident }) {
+  if (!incident.freeze) return null;
+  const bytes = incident.freeze.trace;
+  if (!bytes?.length) return <small>No trace in this older record.</small>;
+  const trace = decodeFreezeTrace(bytes);
+  if (!trace)
+    return (
+      <small>Unrecognized trace format; raw bytes remain in the report.</small>
+    );
+  return (
+    <details>
+      <summary>Freeze trace ({trace.addresses.length} code addresses)</summary>
+      <div>
+        Thread state: {toHex(trace.state)} · flags: {toHex(trace.flags)}
+      </div>
+      <div>Wait queue: {toHex(trace.waitQueue)}</div>
+      <div>Stack pointer: {toHex(trace.stackPointer)}</div>
+      {(trace.flags & 16) !== 0 && (
+        <p>Stack capture unavailable on this target or configuration.</p>
+      )}
+      <ol>
+        {trace.addresses.map((address, index) => (
+          <li key={index}>
+            {index === 0
+              ? (trace.flags & 2) !== 0
+                ? "Interrupted PC: "
+                : "Saved PC: "
+              : "Return candidate: "}
+            <code>{toHex(address)}</code>
+          </li>
+        ))}
+      </ol>
+      <small>
+        Return candidates are not a complete unwound stack. Decode with the ELF
+        of the firmware that recorded this incident.
+      </small>
+      {(trace.flags & 8) !== 0 && (
+        <p>Trace is partial or reached its capture limit.</p>
+      )}
+    </details>
+  );
+}
 
 const PAGE_SIZE = 4;
 
@@ -24,26 +82,31 @@ const PAGE_SIZE = 4;
 // are currently connected, so a relayed request to a disconnected/missing
 // peripheral would otherwise hang forever.
 const RELAY_TIMEOUT_MS = 3000;
-
-interface Status {
-  capacity: number;
-  stored: number;
-  droppedSinceBoot: number;
-  recordingStopped: boolean;
-}
+const RPC_TIMEOUT_MS = 15000;
 
 export function IncidentsSection() {
   const zmkApp = useContext(ZMKAppContext);
-  // 0 = central/local (the only source in Phase D); >0 = split peripheral
-  // slot N, relayed over CONFIG_ZMK_SPLIT_RELAY_EVENT (DESIGN.md SS7). There
+  // 0 = central/local; >0 = split peripheral
+  // slot N, relayed over CONFIG_ZMK_SPLIT_RELAY_EVENT (DESIGN.md, Studio RPC, split relay and client). There
   // is no discovery of how many peripherals are connected, so this offers a
   // small fixed range -- enough for the common single/dual-peripheral split.
   const [source, setSource] = useState(0);
-  const [status, setStatus] = useState<Status | null>(null);
+  const [status, setStatus] = useState<StatusResponse | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
+  const [reportCopied, setReportCopied] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const generation = useRef(0);
+  const requestAbort = useRef<AbortController | null>(null);
+  const [retrieval, setRetrieval] = useState({
+    complete: false,
+    error: null as string | null,
+    received: 0,
+    expected: null as number | null,
+  });
 
   const subsystem = zmkApp?.findSubsystem(SUBSYSTEM_IDENTIFIER) ?? null;
 
@@ -62,145 +125,163 @@ export function IncidentsSection() {
     [zmkApp, subsystem]
   );
 
-  // Awaits the real Response for a request that came back as a
-  // DeferredResponse (source != 0, see DESIGN.md SS7): subscribes to
-  // PeripheralResponse notifications and resolves on the first one matching
-  // requestId, or null after RELAY_TIMEOUT_MS with no answer (peripheral
-  // disconnected/absent -- a documented v1 limitation, there is no way to
-  // detect this ahead of time).
-  const awaitPeripheralResponse = useCallback(
-    (requestId: number): Promise<Response | null> => {
-      return new Promise((resolve) => {
-        if (!zmkApp || !subsystem) {
-          resolve(null);
-          return;
-        }
-        let settled = false;
-        const finish = (value: Response | null) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          unsubscribe();
-          resolve(value);
-        };
-        const unsubscribe = zmkApp.onNotification({
-          type: "custom",
-          subsystemIndex: subsystem.index,
-          callback: (customNotification) => {
-            let notification: Notification;
-            try {
-              notification = Notification.decode(customNotification.payload);
-            } catch {
-              return;
-            }
-            const pr = notification.peripheralResponse;
-            if (pr && pr.requestId === requestId) {
-              finish(pr.response ?? null);
-            }
-          },
-        });
-        const timer = setTimeout(() => finish(null), RELAY_TIMEOUT_MS);
-      });
-    },
-    [zmkApp, subsystem]
-  );
-
-  // Calls the RPC and, if it came back as a DeferredResponse (relayed to a
-  // split peripheral), waits for the real answer instead. Returns null (and
-  // sets an error) on timeout.
-  const callRpcAwaitingRelay = useCallback(
-    async (request: Request): Promise<Response | null> => {
-      const resp = await callRpc(request);
-      if (!resp?.deferred) return resp;
-      const relayed = await awaitPeripheralResponse(resp.deferred.requestId);
-      if (!relayed) {
-        setError(
-          `Peripheral ${source} did not respond (timed out after ${RELAY_TIMEOUT_MS}ms). It may be disconnected.`
-        );
-      }
-      return relayed;
-    },
-    [callRpc, awaitPeripheralResponse, source]
-  );
-
-  const refreshStatus = useCallback(async () => {
-    const resp = await callRpcAwaitingRelay(
-      Request.create({ getStatus: { source } })
-    );
-    if (resp?.status) {
-      setStatus({
-        capacity: resp.status.capacity,
-        stored: resp.status.stored,
-        droppedSinceBoot: resp.status.droppedSinceBoot,
-        recordingStopped: resp.status.recordingStopped,
-      });
-    } else if (resp?.error) {
-      setError(resp.error.message);
-    }
-  }, [callRpcAwaitingRelay, source]);
-
-  const refreshIncidents = useCallback(async () => {
-    const collected: Incident[] = [];
-    let startIndex = 0;
-    // Fetch all pages on connect/refresh -- the store is capped (default 16
-    // incidents), so this is at most a handful of round-trips.
-    for (let guard = 0; guard < 64; guard++) {
-      const resp = await callRpcAwaitingRelay(
-        Request.create({ listIncidents: { startIndex, source } })
+  const callRpcWithRelay = useCallback(
+    async (
+      request: Request,
+      signal?: AbortSignal
+    ): Promise<Response | null> => {
+      if (!zmkApp || !subsystem) return null;
+      const response = await callWithRelay(
+        () => callRpc(request),
+        (callback) =>
+          zmkApp.onNotification({
+            type: "custom",
+            subsystemIndex: subsystem.index,
+            callback: (value) => {
+              try {
+                callback(Notification.decode(value.payload));
+              } catch {
+                /* Ignore malformed broadcasts. */
+              }
+            },
+          }),
+        source,
+        RELAY_TIMEOUT_MS,
+        signal,
+        RPC_TIMEOUT_MS
       );
-      if (!resp?.incidentPage) {
-        if (resp?.error) {
-          setError(resp.error.message);
-        }
-        break;
-      }
-      collected.push(...resp.incidentPage.incidents);
-      startIndex += resp.incidentPage.incidents.length;
-      if (
-        resp.incidentPage.incidents.length === 0 ||
-        startIndex >= resp.incidentPage.total
-      ) {
-        break;
-      }
-    }
-    setIncidents(collected);
-  }, [callRpcAwaitingRelay, source]);
+      if (!response)
+        throw new Error(
+          `Source ${source} did not respond before the RPC/relay deadline`
+        );
+      return response;
+    },
+    [callRpc, zmkApp, subsystem, source]
+  );
 
+  const callRpcAwaitingRelay = useMemo(
+    () => serializeRpc(callRpcWithRelay),
+    [callRpcWithRelay]
+  );
   const refreshAll = useCallback(async () => {
+    requestAbort.current?.abort();
+    const controller = new AbortController();
+    requestAbort.current = controller;
+    const token = ++generation.current;
+    const active = () =>
+      token === generation.current && !controller.signal.aborted;
+    const collected: Incident[] = [];
+    let expected: number | null = null;
     setIsLoading(true);
     setError(null);
+    setCopyError(null);
+    setReportCopied(false);
+    setRetrieval({ complete: false, error: null, received: 0, expected: null });
     try {
-      await refreshStatus();
-      await refreshIncidents();
+      const statusResponse = await callRpcAwaitingRelay(
+        Request.create({ getStatus: { source } }),
+        controller.signal
+      );
+      if (!active()) return;
+      if (!statusResponse?.status)
+        throw new Error(statusResponse?.error?.message ?? "No status response");
+      const loadedStatus = statusResponse.status;
+      if (
+        loadedStatus.stored > loadedStatus.capacity ||
+        loadedStatus.capacity > 65535
+      )
+        throw new Error("Invalid store bounds");
+      expected = loadedStatus.stored;
+      setStatus(loadedStatus);
+      let startIndex = 0;
+      do {
+        const response = await callRpcAwaitingRelay(
+          Request.create({ listIncidents: { startIndex, source } }),
+          controller.signal
+        );
+        if (!active()) return;
+        const page = response?.incidentPage;
+        if (!page)
+          throw new Error(response?.error?.message ?? "No incident page");
+        if (
+          page.startIndex !== startIndex ||
+          page.total !== expected ||
+          page.incidents.length > PAGE_SIZE ||
+          page.incidents.some((incident) => incident.source !== source) ||
+          startIndex + page.incidents.length > expected
+        )
+          throw new Error(
+            "Incident page changed or does not match this source; refresh"
+          );
+        collected.push(...page.incidents);
+        startIndex += page.incidents.length;
+        if (startIndex === expected) break;
+        if (page.incidents.length === 0)
+          throw new Error("Incomplete incident page; refresh");
+      } while (startIndex < expected);
+      setIncidents(collected);
+      setRetrieval({
+        complete: true,
+        error: null,
+        received: collected.length,
+        expected,
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load incidents");
+      if (!active()) return;
+      const message =
+        err instanceof Error ? err.message : "Failed to load incidents";
+      setIncidents(collected);
+      setError(message);
+      setRetrieval({
+        complete: false,
+        error: message,
+        received: collected.length,
+        expected,
+      });
     } finally {
-      setIsLoading(false);
+      if (active()) setIsLoading(false);
     }
-  }, [refreshStatus, refreshIncidents]);
+  }, [callRpcAwaitingRelay, source]);
 
+  const retireRequests = useCallback(() => {
+    ++generation.current;
+    requestAbort.current?.abort();
+  }, []);
+
+  // External transport/source changes invalidate displayed evidence. Keep this
+  // reset immediate so no previous device's records appear as current.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!subsystem || !zmkApp?.state.connection) {
+      retireRequests();
+      setStatus(null);
+      setIncidents([]);
+      setIsLoading(false);
+      setError(null);
+      setActionError(null);
+      setCopyError(null);
+      setReportCopied(false);
+      setConfirmingDeleteAll(false);
+      setRetrieval({
+        complete: false,
+        error: null,
+        received: 0,
+        expected: null,
+      });
       return;
     }
 
-    let cancelled = false;
-
-    const load = async () => {
-      if (!cancelled) {
-        await refreshAll();
-      }
-    };
-
-    void load();
-
-    return () => {
-      cancelled = true;
-    };
+    setStatus(null);
+    setIncidents([]);
+    setConfirmingDeleteAll(false);
+    setActionError(null);
+    void refreshAll();
+    return retireRequests;
     // Re-run when the connected watchdog subsystem becomes available, or
     // when the user switches source (central/peripheral).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subsystem?.index, zmkApp?.state.connection, source]);
+  }, [subsystem?.index, zmkApp?.state.connection, source, retireRequests]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
     if (!zmkApp || !subsystem) return;
@@ -217,18 +298,13 @@ export function IncidentsSection() {
         }
         // Only IncidentRecorded is a live/spontaneous push -- it always
         // describes this device's own local store (source 0), matching
-        // Phase D behavior unchanged. PeripheralResponse notifications are
-        // consumed by awaitPeripheralResponse() above (they are answers to
+        // PeripheralResponse notifications are
+        // consumed by callWithRelay() (they are answers to
         // a specific requestId, not a general live-update stream) and
         // intentionally ignored here.
         if (notification.incidentRecorded?.incident) {
-          const incident = notification.incidentRecorded.incident;
           if (source !== 0) return;
-          setIncidents((prev) => [
-            incident,
-            ...prev.filter((i) => i.id !== incident.id),
-          ]);
-          refreshStatus();
+          void refreshAll();
         }
       },
     });
@@ -237,36 +313,82 @@ export function IncidentsSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zmkApp, subsystem?.index, source]);
 
-  const deleteOne = async (id: number) => {
+  const performDelete = async (request: Request) => {
+    requestAbort.current?.abort();
+    const controller = new AbortController();
+    requestAbort.current = controller;
+    const token = generation.current;
+    const active = () =>
+      token === generation.current && !controller.signal.aborted;
     setIsLoading(true);
-    setError(null);
+    setActionError(null);
     try {
-      const resp = await callRpcAwaitingRelay(
-        Request.create({ deleteIncidents: { ids: [id], all: false, source } })
-      );
-      if (resp?.error) {
-        setError(resp.error.message);
-      }
+      const response = await callRpcAwaitingRelay(request, controller.signal);
+      if (!active()) return;
+      if (response?.error) setActionError(response.error.message);
+      setConfirmingDeleteAll(false);
       await refreshAll();
+    } catch (err) {
+      if (active())
+        setActionError(err instanceof Error ? err.message : "Deletion failed");
     } finally {
-      setIsLoading(false);
+      if (active()) setIsLoading(false);
     }
   };
+  const deleteOne = (id: number) =>
+    performDelete(
+      Request.create({ deleteIncidents: { ids: [id], all: false, source } })
+    );
+  const deleteAll = () =>
+    performDelete(
+      Request.create({ deleteIncidents: { ids: [], all: true, source } })
+    );
 
-  const deleteAll = async () => {
-    setIsLoading(true);
-    setError(null);
-    setConfirmingDeleteAll(false);
+  const copyReport = async () => {
+    const token = generation.current;
+    setReportCopied(false);
+    setCopyError(null);
     try {
-      const resp = await callRpcAwaitingRelay(
-        Request.create({ deleteIncidents: { ids: [], all: true, source } })
+      const report = {
+        format: "zmk-watchdog-report-v1",
+        clientRevision: CLIENT_REVISION,
+        source,
+        status: status && {
+          ...status,
+          previousDiagnostics: Array.from(status.previousDiagnostics),
+        },
+        copiedAt: new Date().toISOString(),
+        retrieval,
+        note: "Use the matching firmware ELF for each incident; stack addresses are candidates.",
+        incidents: incidents.map((incident) => ({
+          ...incident,
+          diagnostics: Array.from(incident.diagnostics ?? []),
+          captureContext: Array.from(incident.captureContext ?? []),
+          ...(incident.fatal
+            ? {
+                fatal: {
+                  ...incident.fatal,
+                  context: Array.from(incident.fatal.context ?? []),
+                },
+              }
+            : {}),
+          ...(incident.freeze
+            ? {
+                freeze: {
+                  ...incident.freeze,
+                  trace: Array.from(incident.freeze.trace ?? []),
+                },
+              }
+            : {}),
+        })),
+      };
+      await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+      if (token === generation.current) setReportCopied(true);
+    } catch (err) {
+      if (token !== generation.current) return;
+      setCopyError(
+        err instanceof Error ? err.message : "Could not copy diagnostic report"
       );
-      if (resp?.error) {
-        setError(resp.error.message);
-      }
-      await refreshAll();
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -286,7 +408,7 @@ export function IncidentsSection() {
   }
 
   // A fixed small range -- there is no RPC to discover how many peripherals
-  // are connected (DESIGN.md SS7), so this just offers "Central" plus a
+  // are connected (DESIGN.md, Studio RPC, split relay and client), so this just offers "Central" plus a
   // handful of peripheral slots. Selecting a peripheral re-fetches status
   // and incidents relayed from that half's own local store.
   const sourceOptions = [0, 1, 2, 3];
@@ -294,7 +416,11 @@ export function IncidentsSection() {
   return (
     <>
       <section className="card">
-        <h2>Status</h2>
+        <h2>Fault and reset diagnostics</h2>
+        <p>
+          Read reset causes, retained incidents and the last recorded
+          operations.
+        </p>
         <div className="source-selector">
           <label htmlFor="watchdog-source-select">
             <strong>Source:</strong>
@@ -312,6 +438,21 @@ export function IncidentsSection() {
             ))}
           </select>
         </div>
+        <p>
+          USB measurement is on hold. Optional console access uses each half's
+          USB console.{" "}
+          <a
+            href="http://127.0.0.1:8820/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open USB telemetry (local)
+          </a>
+          . The peripheral USB console is separate from central Studio access.
+        </p>
+      </section>
+      <section className="card">
+        <h2>Status</h2>
         {source !== 0 && (
           <div className="warning-message">
             <p>
@@ -349,6 +490,7 @@ export function IncidentsSection() {
             </p>
           </div>
         )}
+        {status && <RuntimeDetail status={status} />}
         <button
           className="btn btn-secondary"
           disabled={isLoading}
@@ -360,8 +502,30 @@ export function IncidentsSection() {
 
       <section className="card">
         <h2>Incidents ({incidents.length})</h2>
+        <button
+          className="btn btn-secondary"
+          disabled={isLoading}
+          onClick={copyReport}
+        >
+          Copy diagnostic report
+        </button>
+        {reportCopied && <span role="status">Report copied</span>}
+        {copyError && <p role="alert">{copyError}</p>}
+        {actionError && <p role="alert">{actionError}</p>}
+        {retrieval.error && retrieval.received > 0 && (
+          <p role="alert">
+            Partial report: {retrieval.received} of {retrieval.expected}{" "}
+            incidents loaded.
+          </p>
+        )}
         {incidents.length === 0 ? (
-          <p>No incidents recorded.</p>
+          <p>
+            {retrieval.complete
+              ? "No incidents recorded."
+              : isLoading
+                ? "Loading incidents..."
+                : "No incident records loaded."}
+          </p>
         ) : (
           <div className="table-scroll">
             <table className="incidents-table">
@@ -370,14 +534,14 @@ export function IncidentsSection() {
                   <th>ID</th>
                   <th>Source</th>
                   <th>Type</th>
-                  <th>Boot / Uptime</th>
+                  <th>Incident ordinal / Uptime</th>
                   <th>Detail</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
-                {incidents.map((incident) => (
-                  <tr key={incident.id}>
+                {incidents.map((incident, index) => (
+                  <tr key={`${index}-${incident.id}`}>
                     <td>{incident.id}</td>
                     <td>{sourceLabel(incident.source)}</td>
                     <td>
@@ -392,10 +556,21 @@ export function IncidentsSection() {
                       </span>
                     </td>
                     <td>
-                      #{incident.bootOrdinal} @ {incident.uptimeS}s
+                      #{incident.bootOrdinal} @{" "}
+                      {incident.captureFlags & 2
+                        ? "unavailable (minimal capture)"
+                        : `${incident.uptimeS}s`}
                     </td>
                     <td className="detail-cell">
+                      {incident.captureFlags & 2 ? (
+                        <p>
+                          Capture incomplete; only a minimal explanation was
+                          committed.
+                        </p>
+                      ) : null}
                       {incidentDetailSummary(incident)}
+                      <TraceDetail incident={incident} />
+                      <DiagnosticDetail incident={incident} />
                     </td>
                     <td>
                       <button

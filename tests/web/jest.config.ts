@@ -1,9 +1,12 @@
 import type { Config } from "jest";
 
 const config: Config = {
+  rootDir: "../../web",
+  roots: ["<rootDir>/../tests/web"],
+  modulePaths: ["<rootDir>/node_modules"],
   preset: "ts-jest",
   testEnvironment: "jsdom",
-  setupFilesAfterEnv: ["<rootDir>/test/setup.ts"],
+  setupFilesAfterEnv: ["<rootDir>/../tests/web/setup.ts"],
   moduleNameMapper: {
     // Map the base paths first
     "^@zmkfirmware/zmk-studio-ts-client$":
@@ -26,16 +29,17 @@ const config: Config = {
       "ts-jest",
       {
         tsconfig: {
+          isolatedModules: true,
           jsx: "react-jsx",
           esModuleInterop: true,
           allowSyntheticDefaultImports: true,
+          isolatedModules: true,
         },
-        isolatedModules: true,
         diagnostics: false,
       },
     ],
   },
-  testMatch: ["**/test/**/*.spec.ts", "**/test/**/*.spec.tsx"],
+  testMatch: ["**/tests/web/**/*.spec.ts", "**/tests/web/**/*.spec.tsx"],
 };
 
 export default config;
