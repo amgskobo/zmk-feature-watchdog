@@ -1,859 +1,277 @@
-# zmk-feature-watchdog — Design
-
-Status: **Phases A-E implemented and unit/build tested. Phase F (hardware
-validation) done for everything except the split relay round-trip.**
-Single-board hardware validation (freeze/fatal detection, retained-RAM
-crash-crossing, flash-wear cap, delete/resume, RPC pagination) is
-**complete and green**, and split BLE pairing is confirmed on real
-hardware — see §12.1 for full results, including a real central-boot-hang
-bug found and fixed along the way (a stack overflow in this module's own
-boot self-test, nothing to do with clocks/hardware despite early
-appearances). The split relay round-trip itself (reading a peripheral's
-log from the central) could not be verified working end-to-end despite
-extensive testing, so `CONFIG_ZMK_WATCHDOG_SPLIT_RELAY` now **defaults to
-`n`** (experimental, opt-in) — local per-half incident logging does not
-depend on it and is fully verified. This document remains the source of
-truth for what was built and why; see §13 for phase-by-phase detail and
-§12/§12.1 for the hardware validation checklist
-and results.
-
-## 1. Goal
-
-Detect situations where firmware instability makes the keyboard unusable,
-and record them as persistent incident logs that the user can inspect and
-delete from a web page (custom ZMK Studio RPC + WebSerial UI).
-
-Requirements from the project owner:
-
-- Detect **long thread freezes** (keyboard stops responding but no crash).
-- Detect **hard faults** (stack overflow, bus fault, kernel oops/panic, …).
-- Detect anything else that is cheaply observable (see §4.3 reset-cause audit).
-- Logs are viewable and deletable from a web page.
-- **Flash-wear protection is a hard requirement**: incident count is capped;
-  when the cap is reached, recording **stops** until the user deletes logs
-  from the web page. No ring-buffer overwrite.
-- Works on **split-keyboard peripherals**; peripheral→central transport uses
-  the event relay implemented in the cormoran/zmk fork
-  (`main+custom-studio-protocol`).
-- Hardware validation on this workspace's XIAO nRF52840 + J-Link rig.
-
-## 2. Non-goals (v1)
-
-- Full post-mortem coredumps (Zephyr `CONFIG_DEBUG_COREDUMP` is heavier than
-  needed; our fixed-size incident record is enough to identify the failing
-  thread/PC). Possible future work.
-- Wall-clock timestamps (no RTC; we record `uptime` + `boot_count` instead).
-- Per-peripheral addressing of relay messages (the relay broadcasts to all
-  peripherals; responses carry a `source` slot so the central can tell them
-  apart).
-- Detecting freezes of the BLE controller/radio itself, or any hard lockup
-  that prevents even the task_wdt timer ISR from running (e.g. an IRQ
-  storm): a hardware-watchdog-peripheral backstop for this was prototyped
-  and then removed (§4.1) due to a reset-survival risk on the nRF52840; this
-  category of failure is simply not covered in v1.
-
-## 3. Big picture
-
-```
-            ┌────────────── incident time (may be ISR / fault context) ──────────────┐
- detector ──► fill fixed-size record in __noinit "pending incident" RAM slot ──► sys_reboot()
-            └──────────────────────────────────────────────────────────────────────┘
-                                        reboot
-            ┌────────────── next boot (settings ready, workqueue ctx) ──────────────┐
- boot hook ─► validate magic+CRC of pending slot ─► append to flash log (Zephyr     │
-            │  settings, key per slot) unless cap reached ─► clear pending slot     │
-            └──────────────────────────────────────────────────────────────────────┘
-                                        later
- web UI ◄─ Studio RPC (central only) ◄─ local store ── and, for peripherals:
- web UI ◄─ Studio notifications ◄─ central proxy ◄─ relay events ◄─ peripheral store
-```
-
-Key principle: **never write flash at incident time.** Fault/watchdog context
-is not safe for flash writes. Incidents cross the reboot in retained RAM and
-are persisted by a normal boot-time init hook. Each half (central and
-peripheral) detects and stores **its own** incidents locally; the central
-proxies read/delete requests to peripherals on demand.
-
-## 4. Detection layer
-
-### 4.1 Thread freeze (task watchdog)
-
-Use Zephyr's task watchdog (`subsys/task_wdt`,
-`include/zephyr/task_wdt/task_wdt.h`):
-
-- `task_wdt_init(NULL)` — always software-only, no hardware watchdog
-  peripheral backing it. See "Hardware fallback: prototyped and removed"
-  below for why.
-- One `task_wdt_add(timeout, callback, user_data)` **channel per monitored
-  work queue**. Feeding is done by a self-rescheduling `k_work_delayable`
-  submitted **to the monitored queue**: if the queue is blocked/starved
-  longer than the timeout, the feed never runs and the channel fires.
-- Monitored queues (v1):
-  1. **system workqueue** (`&k_sys_work_q`) — kscan/event-manager processing
-     lives here; a blocked sysworkq = unusable keyboard. Always monitored.
-  2. **ZMK low-priority work queue** (`zmk/app/src/workqueue.c`,
-     `zmk_workqueue_lowprio_work_q()`) — monitored when available.
-  Others (HoG queue, split service queue) are candidates for a later phase;
-  keep the monitor table data-driven (array of `{queue getter, name}`) so
-  adding one is a one-line change.
-- Timeout: `CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS`, default **5000 ms**
-  (well above worst-case legitimate stalls like BLE connection storms or
-  settings writes; short enough to match "user notices the keyboard died").
-  Feed period = timeout / 4.
-- The task_wdt callback runs in **ISR (timer) context**: it must only fill
-  the retained-RAM pending record (freeze detail: channel id, queue name,
-  uptime, boot count) and call `sys_reboot(SYS_REBOOT_WARM)`.
-- **Debugger interaction on this rig**: a J-Link halt pauses this software
-  timer's ISR along with everything else, but expect a spurious FREEZE
-  incident after resuming from a multi-second breakpoint; that's acceptable
-  for a debug rig.
-
-**Hardware fallback: prototyped and removed.** An earlier version of this
-design (and an earlier revision of this module, up to and including Phase F)
-passed a real hardware watchdog device (nRF `wdt0` / devicetree
-`watchdog0` alias) to `task_wdt_init()` as `CONFIG_ZMK_WATCHDOG_HW_FALLBACK`,
-so that a hard lockup that prevents even the task_wdt timer ISR from running
-(e.g. an IRQ storm) would still reset the chip via `CONFIG_TASK_WDT_HW_FALLBACK`.
-This was removed entirely (not kept as an opt-in) after hardware validation
-(§12.1) turned up a credible, serious reset-survival risk:
-
-- The nRF52840's hardware watchdog peripheral, once armed, is **not**
-  cleared by a soft reset or debugger/pin reset — only a real power-on/
-  brown-out reset clears it.
-- Zephyr's LFCLK driver (`drivers/clock_control/clock_control_nrf.c`) does a
-  **one-shot** RC→XTAL clock handoff at boot: it attempts the switch to the
-  external crystal exactly once and never retries. Analysis of that driver
-  (see §12.1) found a plausible mechanism by which a *still-armed* hardware
-  watchdog from a previous boot can interfere with this handoff on the next
-  boot if the board is reset via SWD/software rather than fully power-cycled.
-- The failure mode this produces is a **permanent boot hang** inside
-  `lfclk_spinwait()`, before firmware logic (including this module's own
-  code) ever runs — recoverable only by a real power cycle (battery pull).
-  This was not proven end-to-end with full certainty (the hardware
-  experiment that surfaced it had some methodology confounds — see §12.1),
-  but the mechanism is credible and directly backed by reading the
-  clock-control driver source.
-- Given that, the project owner judged the downside (a "reliability"
-  feature that can itself turn a recoverable freeze into an unrecoverable
-  hang requiring a battery pull) worse than the value a hardware backstop
-  adds on top of the software task_wdt layer, and decided to drop
-  `CONFIG_ZMK_WATCHDOG_HW_FALLBACK` entirely rather than keep it as a
-  risky opt-in. No hardware-watchdog option remains in this module; only
-  the software task_wdt mechanism described above is used.
-
-### 4.2 Fatal errors (hard fault, stack overflow, oops/panic)
-
-Override the weak `k_sys_fatal_error_handler(unsigned int reason, const
-struct arch_esf *esf)` (`zephyr/include/zephyr/fatal.h`; **ZMK does not
-override it** — verified in the fork, so no symbol clash; note in README
-that any other module overriding it conflicts).
-
-- Record: `reason` (`K_ERR_CPU_EXCEPTION`, `K_ERR_STACK_CHK_FAIL`,
-  `K_ERR_KERNEL_OOPS`, `K_ERR_KERNEL_PANIC`, …), `esf->basic.pc`,
-  `esf->basic.lr`, current thread name (`k_thread_name_get(k_current_get())`,
-  requires `CONFIG_THREAD_NAME`; store "?" when unavailable), uptime,
-  boot count. `esf` may be NULL — handle it.
-- Then `sys_reboot(SYS_REBOOT_WARM)`. Never return. (Upstream default would
-  halt forever — rebooting is itself a usability improvement.)
-- Handler must be minimal: no logging subsystem calls except `LOG_PANIC()`,
-  no threading APIs, no flash.
-- Stack overflow detectability depends on `CONFIG_HW_STACK_PROTECTION`
-  (MPU, available on nRF52840, default y in Zephyr for cortex-m with MPU)
-  → arrives as `K_ERR_STACK_CHK_FAIL` / MPU fault. Document in README;
-  don't force-select.
-
-### 4.3 Boot-time reset-cause audit
-
-At boot, `hwinfo_get_reset_cause()` (`drivers/hwinfo`, nRF impl maps
-`RESET_WATCHDOG` BIT(4), `RESET_CPU_LOCKUP` BIT(8), `RESET_BROWNOUT`
-BIT(2)):
-
-- If the cause contains WATCHDOG / CPU_LOCKUP / BROWNOUT **and** there is no
-  pending retained record explaining it, log a `RESET_CAUSE` incident with
-  the raw cause bits. This is the degraded path that catches hard-WDT resets
-  and lockups where no software ran.
-- Call `hwinfo_clear_reset_cause()` after reading (nRF cause bits accumulate
-  across resets; without clearing, every boot re-reports old causes).
-- Not available on native_sim (returns 0 causes) — code must treat "no
-  causes" as normal.
-
-### 4.4 Test/fault injection (for hardware validation)
-
-A separate Kconfig (`CONFIG_ZMK_WATCHDOG_TEST_INJECTION`, default n, enabled
-in test firmware only) adds RPC requests that deliberately:
-
-- block the system workqueue forever (`k_sleep(K_FOREVER)` in a work item) →
-  validates freeze path end-to-end;
-- `k_oops()` / NULL-function-pointer call → validates fatal path;
-
-Without this, hardware validation of a watchdog is impossible. It must be
-clearly marked dangerous and default-off.
-
-## 5. Crossing the reboot: retained RAM pending slot
-
-A single static `__noinit` struct (no devicetree overlay needed — simplest
-and board-agnostic):
-
-```c
-struct zmk_watchdog_pending {
-    uint32_t magic;           /* 0x57444741 'WDGA' */
-    struct zmk_watchdog_incident_record record;  /* fixed-size, §6 */
-    uint32_t crc;             /* crc32_ieee over record */
-} __noinit_section;           /* plain __noinit static */
-```
-
-- nRF52840 SRAM survives `SYSRESETREQ` (verified fact on this rig — even RTT
-  buffers survive reflash; see skills/develop-zmk-module hardware-rig notes).
-- Boot hook (`SYS_INIT`, `APPLICATION` level, then deferred to the low-prio
-  workqueue once settings are loaded — remember the pitfall that
-  `settings_load()` runs from `main()` **after** all SYS_INIT levels):
-  validate magic+CRC → hand record to the store (§6) → zero the slot.
-- CRC + magic makes cold boots / bootloader-clobbered RAM safe (record is
-  simply discarded).
-- native_sim: `__noinit` does **not** survive process restart; unit tests
-  inject records by calling the boot-conversion function directly.
-
-## 6. Storage layer (both roles)
-
-**Backend: raw Zephyr settings subsystem** (not zmk-feature-custom-settings).
-Rationale: peripherals must store incidents too and shouldn't pull in the
-custom-settings RPC machinery; a fixed-size binary record with a key per
-slot maps directly onto settings; and it avoids custom-settings' RAM-cache
-overhead and macro pitfalls. (ZMK `imply SETTINGS` covers real boards;
-BLE bonds already require settings on both halves. native_sim tests must
-enable `CONFIG_SETTINGS` + a backend explicitly — ARCH_POSIX is excluded
-from ZMK's imply.)
-
-- Keys: `wdg/i/<slot>` (record blob), slots `0..CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS-1`.
-- Record: one fixed-size packed struct `zmk_watchdog_incident_record`
-  (target ≤ 64 bytes; **hard limit: must fit a relay event payload**, i.e.
-  ≤ `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` (default 128) with headroom):
-  `{ uint16 id; uint8 type; uint8 flags; uint32 boot_count; uint32 uptime_s;
-     union detail { freeze{...}; fatal{reason,pc,lr,thread[16]}; reset{cause}; } }`
-  plus a record-format version byte for forward compatibility.
-- In-RAM index: bitmap of used slots + copy of records (≤ 16×64 B = 1 KiB,
-  acceptable; keeps RPC list handling out of flash-read paths). Built at
-  boot by `settings_load_subtree("wdg")` handler.
-- **Cap semantics (the flash-wear guarantee):** append picks the first free
-  slot; if none, the incident is **dropped** and only a RAM
-  `dropped_since_boot` counter increments (no flash write at all).
-  Deleting a slot (`settings_delete`) frees it for future incidents.
-- `boot_count`: a `wdg/meta` settings entry incremented once per boot?
-  **No** — that would write flash on every boot (wear). Instead increment
-  it **only when an incident is persisted** (store "incident ordinal") and
-  keep relative ordering by `id` = monotonically increasing ordinal stored
-  in `wdg/meta` alongside — one small meta write per incident, amortized
-  into the same event. uptime still distinguishes incidents within a boot.
-
-## 7. Split support (peripheral ↔ central)
-
-Studio RPC exists **only on the central** (`ZMK_STUDIO_RPC` is gated on
-`!ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL`). Peripherals detect and store
-locally (§4–6 run identically on both roles); the central **proxies**
-web-UI requests over the event relay, copying the proven pattern from
-`zmk-driver-pmw3610-with-custom-studio-rpc/src/split/pmw3610_relay.c`.
-
-Relay API (fork `main+custom-studio-protocol`,
-`app/include/zmk/event_manager.h`):
-
-- `ZMK_RELAY_EVENT_HANDLE(type, "id4", source_field)` — receive side.
-- `ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL(type, "id4", source_field)` /
-  `ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(...)` — send side; only forwards
-  events whose source field is `ZMK_RELAY_EVENT_SOURCE_SELF` (0xFF).
-- Receive rewrites `source` to sender slot + 1; central = 0.
-- Payload ≤ `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` (default 128, hard wire
-  ceiling 255); identifier ≤ 4 chars. `BUILD_ASSERT` both.
-- Requires `CONFIG_ZMK_SPLIT_RELAY_EVENT=y`; central→peripheral is a
-  broadcast to all peripherals.
-
-Events (identifiers): `"wdq"` request (central→peripheral: list / delete /
-status, tiny nanopb-encoded payload) and `"wdp"` response
-(peripheral→central: **one incident record per event** — a record ≤64 B fits
-one relay payload; plus status/ack/done messages with an incident count).
-
-Flow for the web UI reading peripheral logs (async, as in pmw3610):
-
-1. Web → central RPC `ListIncidents{source: N}` → handler raises `"wdq"`
-   relay request, responds immediately with an ack (`in_progress = true`).
-2. Peripheral receives, walks its store, raises one `"wdp"` response per
-   record + a final `done{count}`.
-3. Central receives `"wdp"` events and forwards each as a **Studio custom
-   notification** (`raise_zmk_studio_custom_notification`, encoded from the
-   module's proto `Notification` message) to the web UI, which accumulates
-   them.
-4. Delete works the same with a small ack (deleted count).
-
-Timeouts: web-side (react) 3 s wait for `done`; peripheral absent/disconnected
-⇒ central knows connected slots? — it doesn't reliably; keep it simple: the
-UI shows "no response" after timeout. Document as v1 limitation.
-
-Central's own logs are answered **synchronously** in the RPC response
-(paginated, §8) — no relay involved for source 0.
-
-### 7.1 Relay wire format: stream one incident per event (keep DATA_LEN small)
-
-**Verified 2026-07-05 by reading the fork's actual relay transport**
-(`app/include/zmk/split/transport/types.h`,
-`app/src/split/bluetooth/relay_event.h`): a relay event is a small
-fixed-size datagram — `relay_event_header.event_data_size` is a `uint8_t`,
-so no relay event can ever exceed 255 bytes, and the whole nanopb-encoded
-payload must be materialized in one static buffer before the event is
-raised (no streaming is possible *within* one relay event; this is a
-one-shot small-datagram transport, unlike §7.2's Studio RPC transport).
-
-Consequently: **do not embed a whole paginated `IncidentPageResponse`
-(multiple incidents) inside one relay event.** That forces
-`CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` up from its default 128 (an
-earlier revision of this design needed 240 for a 3-incident page + relay
-envelope). Instead, stream the peripheral's `ListIncidents` answer as
-**one relay event per incident**, keeping every relay event's payload
-close to "one `Incident` + envelope" regardless of page size:
-
-- Add a relay-only `RelayIncidentChunk { bool done; uint32 total;
-  uint32 start_index; Incident incident; }` message. `RelayResponse`
-  becomes a oneof: `Response response` (unchanged, used as-is for
-  GetStatus/DeleteIncidents/InjectTest/Error — already small, single
-  event) or `RelayIncidentChunk incident_chunk` (ListIncidents only).
-- Peripheral responder: for a `ListIncidents` request, still call
-  `watchdog_request_exec_handle()` exactly as today (unchanged — it
-  builds a normal `Response{incident_page:{...}}` using the *local*
-  page size), then **iterate that in-RAM result** and raise one
-  `RelayResponse{incident_chunk:{done:false, incident:incidents[i], ...}}`
-  event per incident, followed by one final
-  `{done:true, total, start_index}` event with no incident. For every
-  other request type, raise a single `RelayResponse{response:...}` event
-  exactly as before — no change.
-- Central dispatcher: unchanged for non-list responses (wrap+raise a
-  `PeripheralResponse` Studio notification immediately, as today). For
-  `incident_chunk` events, accumulate incidents into a small static
-  array (bounded by the same local page-size cap the peripheral used —
-  trivial RAM, one page's worth) keyed by the in-flight `request_id`;
-  on `done:true`, build the **same** `PeripheralResponse{response:
-  {incident_page:{incidents, total, start_index}}}` Studio notification
-  the web UI already expects and raise it once. **The public
-  Notification/Response proto and the web UI do not change at all** —
-  only the private peripheral↔central wire format (`RelayRequest`/
-  `RelayResponse`, already documented as "never sent directly over the
-  Studio RPC transport") is restructured.
-- Net effect: `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` can stay at its
-  framework default (128); the local (source 0) `ListIncidents` page size
-  is now decoupled from both DATA_LEN and TX_BUF_SIZE (§7.2) and can be
-  chosen purely for UX (this doc's original sketch's "≤4" is fine again).
-
-## 7.2 Studio RPC TX buffer: genuinely streaming, do not scale with response size
-
-**Verified 2026-07-05 by reading the fork's actual RPC transport**
-(`app/src/studio/rpc.c`'s `send_response`/`rpc_tx_buffer_write`, and both
-`uart_rpc_transport.c`'s and `gatt_rpc_transport.c`'s `tx_notify`): unlike
-the relay transport above, `CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` backs a
-**ring buffer**, not a "whole response must fit here" buffer.
-`pb_ostream_for_tx_buf()` gives nanopb's `pb_encode()` a callback-based
-`pb_ostream_t` (`max_size = SIZE_MAX`) whose write callback
-(`rpc_tx_buffer_write`) claims ring-buffer space, writes what fits, calls
-the transport's `tx_notify` to drain toward the wire (UART: enables TX
-IRQ or polls out bytes once half-full/done; BLE: queues a GATT
-indication and re-arms on each `indicate_cb`), and if the ring buffer is
-momentarily full it just `k_sleep(K_MSEC(1))` and retries — it never
-gives up or truncates. The custom-subsystem response field
-(`zmk_custom_CallResponse.payload`) is itself a nanopb callback field;
-per `zmk/studio/custom.h`'s own doc comment, nanopb invokes our encode
-callback in **two passes** (a counting pass into an internal sizing
-stream that discards bytes, then a real pass through the same streaming
-ring-buffer chain above) — neither pass ever needs the whole encoded
-response to exist in one buffer.
-
-Consequently: **`CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` does not need to be
-raised to fit a full `IncidentPageResponse`** (an earlier revision of
-this design set it to 512 with a `BUILD_ASSERT(encoded_max + 64 <=
-TX_BUF_SIZE)` — both were unnecessary caution copied from a general
-pitfall note that does not apply to this exact streaming mechanism).
-Leave it at the framework default (64) unless hardware validation (§12)
-finds a concrete problem; drop the response-size `BUILD_ASSERT` entirely.
-This is unrelated to §7.1's relay `DATA_LEN` fix — the relay transport
-(one-shot small datagram) and the Studio RPC transport (streaming ring
-buffer) have fundamentally different size constraints and must not be
-confused with each other.
-
-## 8. Studio RPC + proto
-
-Subsystem identifier: `cormoran__watchdog` (created by the template's
-`init_module.py`). Proto package `cormoran.watchdog` at
-`proto/cormoran/watchdog/watchdog.proto` (+ `.options` file — every
-string/bytes needs `max_size`; **no 64-bit types**; set `has_<field>=true`
-for every sub-message — nanopb pitfalls from skills/develop-zmk-module).
-
-Messages (sketch — implementer finalizes):
-
-```proto
-Request  = oneof { GetStatus, ListIncidents{source,start}, DeleteIncidents{source, ids[], all}, InjectTest{kind} }
-Response = oneof { Error{msg}, Status, IncidentPage, DeleteResult{deleted,in_progress}, InjectAck }
-Status   = { capacity, stored, dropped_since_boot, recording_stopped, split_supported }
-Incident = { id, source, type enum{FREEZE,FATAL,RESET_CAUSE}, boot_ordinal, uptime_s,
-             oneof detail { Freeze{queue_name}, Fatal{reason,pc,lr,thread_name}, Reset{cause_bits} } }
-IncidentPage = { total, start, incidents[≤4], in_progress /* true when relayed */ }
-Notification = oneof { RelayedIncident{Incident}, RelayDone{source,count}, RelayDeleteResult{source,deleted},
-                       IncidentRecorded{Incident} /* optional live push when a new incident is persisted */ }
-```
-
-- **Pagination instead of streaming**: ≤ 4 incidents per response keeps the
-  encoded response comfortably under a 512-byte TX buffer
-  (`CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=512` in test configs +
-  `BUILD_ASSERT(encoded_max + 64 <= TX_BUF)`); response structs in
-  **static** storage (encoding runs after the handler returns).
-- `CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE=128` as usual.
-- Kconfig: `ZMK_WATCHDOG_STUDIO_RPC` depends **only on `ZMK_STUDIO`** (not
-  on the detectors) and handlers must work with an empty store — this is
-  what lets native_sim unit tests drive the whole RPC surface (zero-device
-  pitfall from skills/develop-zmk-module).
-
-## 9. Web UI
-
-Extend the template's `web/src/App.tsx` (React +
-`@cormoran/zmk-studio-react-hook`, `ZMKCustomSubsystem.callRPC`, generated
-ts-proto types via `buf generate`):
-
-- **Status card**: capacity, stored count, `recording_stopped` banner
-  ("log full — recording paused; delete incidents to resume"),
-  dropped-since-boot counter.
-- **Incident table**: id, source (Central / Peripheral N), type badge,
-  boot ordinal + uptime, detail column (thread/queue name, reason+PC/LR in
-  hex, reset-cause bits decoded to names). Source selector triggers the
-  relay flow for peripherals and accumulates notification-delivered rows.
-- **Delete**: per-row delete + "delete all (this source)" with confirm.
-- Subscribe to notifications for relayed rows / completion / live
-  `IncidentRecorded`.
-- Keep the template's connection scaffold; this is one page, no routing.
-
-## 10. Kconfig summary
-
-Template initialization produced `CONFIG_ZMK_WATCHDOG_FEATURE` and
-`CONFIG_ZMK_WATCHDOG_FEATURE_STUDIO_RPC` (mechanical rename of
-`ZMK_TEMPLATE_FEATURE*`). **Phase B renames these** to the table below
-(`ZMK_WATCHDOG`, `ZMK_WATCHDOG_STUDIO_RPC`) — grep every reference:
-`Kconfig`, `CMakeLists.txt`, `tests/studio/native_sim.conf`,
-`tests/zmk-config/build.yaml`, README, and the keycode_events snapshot's
-registration expectations if config names appear there.
-
-| Symbol | Default | Meaning |
-|---|---|---|
-| `ZMK_WATCHDOG` | n | core: store + boot hook + reset-cause audit |
-| `ZMK_WATCHDOG_FREEZE_DETECT` | y if ZMK_WATCHDOG | task_wdt monitor (selects `TASK_WDT`) |
-| `ZMK_WATCHDOG_FREEZE_TIMEOUT_MS` | 5000 | freeze threshold |
-| `ZMK_WATCHDOG_FATAL_DETECT` | y if ZMK_WATCHDOG | fatal-handler override |
-| `ZMK_WATCHDOG_MAX_INCIDENTS` | 16 | flash slot cap (per half) |
-| `ZMK_WATCHDOG_STUDIO_RPC` | y if ZMK_STUDIO && ZMK_WATCHDOG | RPC subsystem (central) |
-| `ZMK_WATCHDOG_SPLIT_RELAY` | y if ZMK_SPLIT && ZMK_WATCHDOG | relay proxy/responder (needs `ZMK_SPLIT_RELAY_EVENT`) |
-| `ZMK_WATCHDOG_TEST_INJECTION` | n | dangerous fault/freeze injection RPC |
-
-## 11. Source layout
-
-```
-src/watchdog_store.c        # settings-backed slot store + RAM index + cap
-src/watchdog_pending.c      # __noinit slot, CRC, boot conversion hook
-src/watchdog_freeze.c       # task_wdt channels + feed works
-src/watchdog_fatal.c        # k_sys_fatal_error_handler override
-src/watchdog_reset_cause.c  # boot-time hwinfo audit
-src/watchdog_inject.c       # test injection (Kconfig-gated)
-src/split/watchdog_relay.c  # wdq/wdp events, peripheral responder, central proxy
-src/studio/watchdog_handler.c
-include/cormoran/zmk/watchdog.h   # record struct, store API (used by tests)
-proto/cormoran/watchdog/watchdog.proto|.options
-web/src/App.tsx (+ components)
-tests/...                   # see §12
-```
-
-`reboot` and `time` are wrapped behind tiny functions (`watchdog_reboot()`,
-weak/testable) so native_sim tests can intercept instead of dying.
-
-## 12. Test plan
-
-**native_sim unit tests** (`west zmk-test tests -m .`, via `python3 -m unittest`):
-
-- store: append/read/delete/cap-stop/drop-count/persistence-across-
-  `settings_load` (needs `CONFIG_SETTINGS` + backend in native_sim conf —
-  check what the template/custom-settings tests already enable and copy).
-- pending: fabricate record → boot-convert → appears in store; bad CRC →
-  discarded.
-- freeze: block a monitored queue in a test work item → task_wdt callback →
-  (intercepted reboot) → pending slot filled correctly.
-- RPC: full request/response matrix against an empty and a populated store,
-  pagination boundaries, delete, status; injection ack.
-- relay: raise synthetic `wdq`/`wdp` events at the handlers directly
-  (both role compile paths built by build tests).
-
-**build tests** (`tests/zmk-config/build.yaml`): xiao_ble + tester_xiao
-central-with-studio build; a split peripheral build with relay on; a
-minimal no-studio build (core only). Use snippets under
-`tests/zmk-config/snippets/` (remember the `RC()` macro clash and
-tester_xiao pin-conflict pitfalls if any overlay is added).
-
-**Hardware (Phase F)** on this rig (read
-`skills/develop-zmk-module/references/hardware-rig.md` + `skills/debug-zmk-jlink`
-first — flash offset `CONFIG_FLASH_LOAD_OFFSET=0x0` workaround, RTT read via
-JLinkExe `savebin`, RTT control-block zeroing before reflash,
-`CONFIG_LOG_PROCESS_THREAD_STARTUP_DELAY_MS=0`, pyusb RPC transport):
-
-1. Flash test build (`ZMK_WATCHDOG_TEST_INJECTION=y`, studio on).
-2. `inject freeze` → observe reboot → `list` shows FREEZE incident with the
-   right queue name; RTT log confirms boot-time conversion.
-3. `inject fault` → FATAL incident with plausible PC/LR.
-4. Repeat until cap → `status.recording_stopped=true`, further injections
-   only bump `dropped_since_boot`.
-5. `delete all` → recording resumes.
-6. Web UI smoke test if a browser is available; otherwise the pyusb CLI
-   (`tools/zmk-studio-rpc custom-call`) covers the RPC surface.
-
-(A hardware-watchdog-vs-debugger sanity check previously appeared here; it
-no longer applies now that the hardware fallback has been removed — see §4.1
-"Hardware fallback: prototyped and removed" and §12.1.)
-
-Split relay on real hardware was attempted once this rig grew a second board
-(see §12.1) but was not completed; native_sim/relay unit tests + split build
-tests remain the primary evidence for that path.
-
-### 12.1 Hardware validation results (2026-07-05)
-
-**Single board (XIAO nRF52840 "Module Test", J-Link `1050398082`, flash-offset-0
-workaround) — thoroughly validated, all green:**
-
-- Flashed `module_watchdog_board_test_injection`
-  (`CONFIG_ZMK_WATCHDOG_TEST_INJECTION=y`, Studio RPC on). Confirmed via
-  Studio RPC (`core.get_device_info`, `custom.list_custom_subsystems` →
-  `cormoran__watchdog`).
-- `InjectTestRequest{FREEZE_KIND}` → device stopped responding, rebooted
-  after the 5 s timeout, re-enumerated; `ListIncidents` showed a `FREEZE`
-  incident with `queue_name: "sysworkq"` — proves the task_wdt channel,
-  retained-RAM pending slot, and boot-time conversion all work correctly
-  end-to-end on real hardware.
-- `InjectTestRequest{FATAL_KIND}` → request itself failed with a USB pipe
-  error (expected: `k_oops()` runs synchronously in the RPC handler's own
-  call stack, so the device faults before a response can be sent) →
-  reboot → `FATAL` incident recorded with `reason: 3` (exactly
-  `K_ERR_KERNEL_OOPS`, matching `k_oops()`) and plausible `pc`/`lr` values.
-  Repeated 6 times total across the session; reason/pc/lr were identical
-  every time (deterministic fault site), as expected.
-- Filled the store to `capacity` (16) via 13 more `FATAL_KIND` injections;
-  `GetStatus` correctly showed `recording_stopped: true` at exactly 16
-  stored. One further injection was **dropped** (`stored` stayed 16,
-  `dropped_since_boot` incremented to 1, no flash write) — proves the
-  flash-wear cap works exactly as designed.
-- `DeleteIncidents{all: true}` → `stored: 0`, `recording_stopped` cleared
-  — recording resumed correctly.
-- `ListIncidents` pagination verified with 5 stored incidents: page 0
-  returned exactly 4 (`WATCHDOG_RPC_PAGE_SIZE`), page 1 (`start_index: 4`)
-  returned the remaining 1 with `total: 5` — matches native_sim coverage.
-- **Reset-cause audit also engaged unprompted** during this session — a
-  `RESET_CAUSE` incident with `cause_bits: 18` (`RESET_WATCHDOG |
-  RESET_SOFTWARE`) appeared once, most likely from one of several manual
-  `JLinkExe` SWD resets performed while investigating tooling issues (see
-  below) rather than from the module's own detectors, but it confirms the
-  degraded fallback path (§4.3) does fire correctly and does not crash or
-  duplicate when it does.
-- **Tooling finding, not a firmware bug**: after a *software*-triggered
-  reboot (`sys_reboot()`, or an equivalent JLink `r`/`AIRCR.SYSRESETREQ`
-  reset), this sandbox's host-side USB hotplug sync sometimes fails to
-  create the `/dev/zmk-hp-zmk-tty-*` symlink for the new enumeration (the
-  underlying kernel `ttyACM*` device and its sysfs `cdc_acm` binding exist
-  fine — confirmed via `/sys/bus/usb/devices/.../tty/ttyACMN` — but no
-  `/dev` node appears, even after `udevadm settle`, for minutes). The
-  existing `docs/zmk-studio-rpc.md` pyusb transport
-  (`--transport pyusb`) bypasses this entirely (talks to the CDC bulk
-  endpoints directly via libusb, no OS tty node needed) and was used for
-  the rest of this session once discovered. Worth folding into
-  `skills/debug-zmk-jlink` as a documented workaround for post-*software*-
-  reboot (as opposed to post-*flash*) enumeration flakiness.
-
-**Split (2 boards) — attempted, blocked by a hardware issue on the second
-board, not completed:**
-
-Built `module_watchdog_split_peripheral` (Module Test board) and
-`module_watchdog_split_central` (Abyss Tester XIAO, J-Link `1057792823`, no
-flash-offset workaround needed) per `skills/debug-zmk-split`. The
-peripheral flashed and ran correctly (confirmed stable USB re-enumeration,
-no crash). **The central board failed to boot past very early
-initialization**: `JLinkExe`/GDB backtraces repeatedly caught it inside
-`lfclk_spinwait()` (`drivers/clock_control/clock_control_nrf.c`) — a
-busy-wait for the external 32.768 kHz crystal (LFXO, this board's default
-`CONFIG_CLOCK_CONTROL_NRF_K32SRC_XTAL=y`) to report stable, which never
-happened. Trying `CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y` (internal RC
-oscillator) as a diagnostic did not help. **The user physically
-power-cycled this board mid-session**, after which the clock issue
-resolved (subsequent GDB backtraces showed genuine, deep BLE controller
-activity — real HCI command processing via the ticker/mayfly scheduler,
-not a hang) — consistent with this being a marginal crystal
-startup/hardware condition on this specific unit rather than a firmware
-bug (nothing in this module touches clock configuration). However, even
-after the power cycle, this board's USB never enumerated (confirmed via
-raw `lsusb`, not just the `/dev` symlink layer) and its RTT log buffer's
-write offset stayed at 0 despite ~90 s of additional waiting, so Studio
-RPC access to it was never established this session. Given the
-substantial hardware time already spent and that this points to a
-rig/hardware condition independent of the watchdog module's own code, hardware
-split validation was stopped here rather than pursued further; the
-peripheral was left flashed with a clean, non-looping build
-(`module_watchdog_split_peripheral`, no test-injection auto-trigger) so
-the rig is in a good state for a future session. **Recommendation for
-whoever picks this up**: start with a fresh physical power cycle of the
-Abyss Tester XIAO board before flashing anything, and confirm plain
-`core.get_device_info` over Studio RPC works *before* layering the
-watchdog-specific relay checks on top.
-
-**Follow-up conclusion (post-Phase-F): `lfclk_spinwait()` hang traced to a
-plausible interaction with `CONFIG_ZMK_WATCHDOG_HW_FALLBACK`, feature
-removed.** A code-analysis pass (over `drivers/clock_control/clock_control_nrf.c`)
-investigating this central-board hang found a credible mechanism connecting
-it to this module's (now-removed) hardware-watchdog fallback: the
-nRF52840's hardware watchdog peripheral survives soft/debugger/pin resets
-(only POR/BOR clears it), and the LFCLK driver's RC→XTAL clock handoff is
-one-shot (attempted once at boot, never retried). If a prior boot had armed
-the hardware watchdog (via `CONFIG_ZMK_WATCHDOG_HW_FALLBACK=y`) and the board
-was then reset other than by a full power cycle, the still-running old
-watchdog could plausibly block the LFCLK handoff on the next boot, hanging
-the board forever in `lfclk_spinwait()` — matching what was observed on the
-central board above. This was **not proven with full certainty** end-to-end
-(this session's hardware experiment had methodology confounds — notably, the
-user's physical power cycle mid-session, which per this mechanism should
-have been the fix, is also consistent with several other explanations for a
-marginal-crystal condition), but the mechanism is well-supported by the
-driver source and the downside is severe enough (a device that can only be
-recovered with a battery pull) that the project owner decided to remove
-`CONFIG_ZMK_WATCHDOG_HW_FALLBACK` entirely rather than keep it as an opt-in.
-See §4.1 "Hardware fallback: prototyped and removed" for the full writeup;
-this module no longer offers any hardware-watchdog-backed fallback.
-
-**Post-removal re-test: the central-board hang is confirmed NOT caused by
-this module.** After removing `CONFIG_ZMK_WATCHDOG_HW_FALLBACK` (commit
-`4a23446`), two things were re-verified on hardware:
-
-- **Single board (Module Test)**: rebuilt/reflashed
-  `module_watchdog_board_test_injection` with the fix. `InjectTestRequest{FREEZE_KIND}`
-  and `{FATAL_KIND}` both still recorded correct incidents
-  (`queue_name: "sysworkq"`; `reason: 3`/`K_ERR_KERNEL_OOPS` with plausible
-  `pc`/`lr`) — the software-only `task_wdt` and fatal-handler paths are
-  completely unaffected by removing the hardware fallback, as expected.
-- **Central board (Abyss Tester XIAO)**: rebuilt `module_watchdog_split_central`
-  with the fix (no hardware watchdog ever armed — confirmed by reading
-  `subsys/task_wdt/task_wdt.c`: all hardware-watchdog activation is gated
-  behind `if (hw_wdt)`, and this module now always calls
-  `task_wdt_init(NULL)`) and reflashed the same physical board that had
-  previously hung. **It hung again, in the exact same place**
-  (`lfclk_spinwait()`, identical backtrace). This **falsifies** the
-  hardware-watchdog/LFCLK-handoff hypothesis as the cause of this specific
-  board's hang — with the hardware watchdog now structurally incapable of
-  ever being armed by this module, the hang still occurs, so something
-  else (most likely a genuinely marginal crystal/oscillator on this
-  specific physical unit, independent of any firmware this module
-  controls) is responsible. The `CONFIG_ZMK_WATCHDOG_HW_FALLBACK` removal
-  remains the right call regardless — it closed a real, credible risk
-  path even though it turned out not to be *this* board's problem — but
-  whoever resumes split hardware validation should not expect removing it
-  to have fixed the Abyss Tester XIAO board; a physical power cycle
-  (as before) is still the known, if unexplained, workaround.
-
-**Final conclusion (supersedes all of the above `lfclk_spinwait` theorizing):
-the "central hangs" bug was a plain main-thread stack overflow in this
-module's own test code, unrelated to clocks, crystals, or hardware
-condition.** A later session ran a clean hardware bisection (same
-physical board, same flash offset, toggling exactly one
-`CONFIG_ZMK_WATCHDOG_*` sub-feature at a time) and found the hang tracked
-`CONFIG_ZMK_WATCHDOG_SPLIT_RELAY` exactly -- but the actual culprit was
-`CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST`'s central-side boot self-test
-(depends on `SPLIT_RELAY`, so it silently rode along in every bisection
-step), whose `watchdog_split_relay_central_test_init()` (a `SYS_INIT` at
-`APPLICATION` priority, on the main thread, before `zmk_usb_init()`) kept
-two ~240-byte `cormoran_watchdog_Response` structs as stack locals,
-overflowing `CONFIG_MAIN_STACK_SIZE=1024`'s guard region before USB ever
-came up. Every earlier "stuck in `lfclk_spinwait()`" observation was a
-debugger sampling a device that had crashed at boot, rebooted (because
-`CONFIG_ZMK_WATCHDOG_FATAL_DETECT` was also on), and was burning most of
-each short boot cycle re-spinning up the LFCLK crystal -- not an actual
-clock hang. **Fixed** by making the two response structs `static` (commit
-`d514ea8`); verified with a controlled same-board/same-offset A/B test
-(`CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST=n` boots, `=y` with the old code
-hung, `=y` with the fix boots) and confirmed on the standard
-`module_watchdog_split_central` artifact (self-test included) with real
-Studio RPC access afterward. The earlier crystal/hardware-condition theory
-was a red herring produced by debugging a crash loop as if it were a
-clock driver bug.
-
-**Split relay round-trip: still not verified working, disabled by
-default.** With the boot hang fixed, split BLE pairing was confirmed on
-real hardware (peripheral RTT log shows `security_changed` at level 2 and
-both `split_svc_pos_state_ccc`/`split_svc_relay_event_ccc` CCC
-subscriptions at value 1 -- the central correctly subscribed to the relay
-event characteristic). However, an actual relayed request
-(`ListIncidents`/`GetStatus` with a nonzero `source`) never completed:
-the central always accepts it and returns a `DeferredResponse`, but no
-`PeripheralResponse` notification was ever observed to arrive, across
-many repeated attempts under varied conditions (immediately after fresh
-pairing, after 60+ seconds of a stable, crash-free connection confirmed
-via unchanged local incident counts, before and after reconnects).
-Hypotheses ruled out: wrong relay `source` tagging (`ZMK_RELAY_EVENT_SOURCE_SELF`
-is correctly set in `send_relay_request()`), a GATT-discovery race
-(`update_peripherals_relay_event_work_handler` in the ZMK fork's
-`central.c` does log-and-drop if `relay_event_subscribe_params.value_handle`
-isn't yet populated, but waiting 60+ s past pairing didn't help), and the
-peripheral simply being mid-crash-reboot (confirmed stable via unchanged
-local incident count spanning the failed attempt). Root cause not
-isolated -- diagnosing further required reading the central's RTT log,
-but JLink halts needed for that reliably re-triggered the (separate, real,
-Zephyr-upstream) `LL_ASSERT_OVERHEAD` BLE-controller assertion described
-below, contaminating the very connection being diagnosed, and building a
-non-invasive Studio-RPC-based diagnostic hit a dead end (ZMK's
-`CMakeLists.txt`/proto generation assumes Studio RPC only ever compiles on
-the central role; forcing it onto a peripheral-role build fails to
-compile). Given this, `CONFIG_ZMK_WATCHDOG_SPLIT_RELAY` was changed to
-**default `n`** (§10/Kconfig, was `default y if ZMK_SPLIT`) so a shipped
-configuration doesn't silently depend on an unverified code path; the
-`watchdog-split-rpc-relay` snippet (used only by this repo's own build
-tests) still explicitly sets it to `y` so the code keeps getting built and
-covered by native_sim/build tests. See README's "Split keyboard
-limitations" for the user-facing version of this same caveat.
-
-**Real, separate finding along the way (Zephyr-upstream, not a bug in this
-module): `LL_ASSERT_OVERHEAD` in `lll_central.c`.** While investigating
-the above, the central *did* genuinely crash a few times independent of
-the (now-fixed) stack overflow, with a deterministic `K_ERR_KERNEL_OOPS`
-fault at `prepare_cb`, `subsys/bluetooth/controller/ll_sw/nordic/lll/lll_central.c:250`
-(`LL_ASSERT_OVERHEAD(overhead)`, firing when `lll_preempt_calc()` reports
-the radio-event prepare callback ran later than its timing budget). A
-code-analysis pass concluded this is a pre-existing Zephyr BLE controller
-fragility under multi-role load (`CONFIG_BT_CENTRAL` + `CONFIG_BT_PERIPHERAL`
-+ `CONFIG_BT_OBSERVER` all active at once, as any ZMK split central is),
-architecturally incapable of being triggered by this module's own code
-(the LLL radio ISR runs at the highest IRQ priority; `task_wdt` feed work
-uses `k_sched_lock`, not `irq_lock`; relay dispatch is fully async/non-blocking).
-Zephyr documents a purpose-built escape hatch for exactly this
-(`CONFIG_BT_CTLR_ASSERT_OVERHEAD_START=n`, in
-`subsys/bluetooth/controller/Kconfig.ll_sw_split`, "permits the Controller
-to gracefully skip radio events... instead of asserting"), but repeated
-attempts to actually apply it in this build (`-D` cmake args, `EXTRA_CONF_FILE`,
-both `=n` and `# ... is not set` syntax, fresh build directories) all
-silently produced `CONFIG_BT_CTLR_ASSERT_OVERHEAD_START=y` anyway (a
-Kconfig warning confirmed the override was seen and rejected -- "was
-assigned the value 'n' but got the value 'y'" -- with no `select`/`imply`
-found anywhere in the tree explaining why). **This override attempt was
-abandoned per the project owner's direction** (not worth the further time
-given the crash is real but was also observed to disappear entirely
-during 100+ seconds of hands-off, JLink-untouched operation, i.e. it's
-rare and appears to be significantly aggravated by JLink debugger halts
-themselves pausing the CPU mid radio-event -- exactly the failure mode
-this assertion detects). No change was made to `CONFIG_BT_CTLR_ASSERT_OVERHEAD_START`
-in this repo; if this crash becomes a practical problem for a real user
-(as opposed to a hardware-debugging artifact), revisit that Kconfig
-override with fresh eyes on the "why doesn't my override apply" puzzle
-first.
-
-**Split relay round-trip: root cause found, fixed, verified working
-end-to-end (2026-07-07) -- supersedes "still not verified" above,
-`CONFIG_ZMK_WATCHDOG_SPLIT_RELAY` restored to `default y if ZMK_SPLIT`.**
-None of the timing/connection theories chased in this session's earlier
-investigation (BLE controller radio-timing assertions, a global relay
-chunk-sequence exhausting the ATT buffer pool, a peripheral BLE-init
-hang) turned out to be the actual blocker for a *hands-off* run. The real
-bug: `src/split/watchdog_relay.c`'s `watchdog_relay_process_work_handler()`
-(peripheral role) still contained diagnostic scaffolding from an earlier
-crash-bisection session -- a `printk()` followed by an unconditional
-`return` placed *before* the call to `watchdog_relay_exec_request()`.
-The peripheral had been silently no-op'ing on every relay request; it
-never built or sent a response, so the central's wait always timed out.
-This was invisible in every debugging technique tried (GDB, RTT
-snapshots, non-halting SWD polling) because none of them were pointed at
-"does the peripheral's handler body run at all" -- they were all chasing
-*why the response doesn't arrive*, when the actual answer was "no
-response is ever built." Found by direct code reading while adding
-unrelated diagnostic counters, not by hardware tracing.
-
-Fixed by restoring the real handler body (calls
-`watchdog_relay_exec_request()` -> `stream_incident_page()` or
-`response_to_relay_non_list_response()` -> `raise_relay_response()`) and
-removing the diagnostic code. Verified via `relay_query.py` against real
-hardware (Module Test peripheral, Abyss Tester XIAO central, both
-NVS-erased and freshly paired): 8/9 `GetStatus{source: 1}` relay
-round-trips succeeded end-to-end (`PeripheralResponse` notification with
-`status.capacity: 16` matching the dispatched `request_id`); the one miss
-was the very first request immediately after a fresh pairing, a known
-"connection not yet settled" transient, not a recurrence. `python3 -m
-unittest` (unit + build tests) passes.
-
-Lesson for future hardware-debugging sessions in this repo: when a
-round-trip mysteriously never completes, grep the suspect file for
-leftover `printk`/early-`return` diagnostic scaffolding *before*
-spending hours on timing/connection hypotheses -- see
-`skills/debug-zmk-split/SKILL.md` for the broader methodology notes
-accumulated during this investigation (GDB-attach as a crash confound,
-etc.), and treat "does the handler body even run its real logic" as a
-check to make before "is the transport reliable."
-
-**Follow-up: all three relay request types confirmed on hardware.**
-Same session, immediately after the fix above. `ListIncidents{source:1}`
-(peripheral had 0 stored incidents after an NVS erase -- exercises the
-same `stream_incident_page()`/chunked-response code path with a
-zero-incident page) and `DeleteIncidents{source:1, all:false, ids:[]}`
-(a safe no-op -- exercises the `DeleteResult` relay-response branch) each
-round-tripped correctly 3/3 times, alongside 2 more `GetStatus` repeats.
-`InjectTestRequest` has no `source` field and by design can never be
-relayed (DESIGN.md/`watchdog_handler.c`'s `request_source()`: it always
-executes locally) -- so a real, non-empty `ListIncidents` page cannot be
-produced on a peripheral via any Studio RPC path without deliberately
-crashing it; that data-bearing branch of the chunk-building logic
-remains native_sim-only coverage, which is sufficient since it's pure
-protobuf encoding with no relay/BLE-specific behavior of its own.
-
-## 13. Implementation phases (each = one subagent task)
-
-Phase A — **done** (commit "Initialize zmk-feature-watchdog from module
-template" on `codex/init-watchdog`, pushed). State: placeholders replaced
-(`namespace=cormoran module=watchdog`, subsystem id `cormoran__watchdog`,
-sample handler at `src/studio/watchdog_handler.c`, proto at
-`proto/cormoran/watchdog/watchdog.proto`); isolated west workspace ready
-(`./dependencies`, ~3.9 GB, gitignored); `python3 -m unittest`, all web
-checks, and `SKIP=prettier,eslint,jest,web-build pre-commit run --all-files`
-green. Known quirks: the Studio subsystem registration order in
-`tests/studio/keycode_events.snapshot` is runtime order, not alphabetical —
-re-capture from actual output when it changes; `.github/workflows/template-sync.yml`
-intentionally still points at the upstream template.
-
-- **Phase B — store + pending + boot hook.** §5, §6, Kconfig core, unit
-  tests. Acceptance: store tests green, `python3 -m unittest` green.
-- **Phase C — detectors.** §4.1–4.4 incl. reboot wrapper + injection hooks,
-  freeze unit test, build test configs. Acceptance: freeze test green on
-  native_sim; xiao build test compiles with all detectors on.
-- **Phase D — RPC + web.** §8, §9 for source 0 (local logs), pagination,
-  status, delete, notifications on new local incident. Acceptance: RPC unit
-  tests + `cd web && npm ci && npm run generate && npm test && npm run lint
-  && npm run build` green.
-- **Phase E — split relay proxy.** §7 (`wdq`/`wdp`, responder, proxy,
-  relayed notifications), split build tests. Acceptance: relay unit tests +
-  both role builds green.
-- **Phase F — hardware validation.** §12 checklist on the rig. **Status:
-  single-board portion done and green; split BLE pairing confirmed; a
-  real central-boot-hang bug (stack overflow, unrelated to hardware) was
-  found and fixed along the way (§12.1). The split relay round-trip itself
-  was never verified working end-to-end despite extensive testing, so
-  `CONFIG_ZMK_WATCHDOG_SPLIT_RELAY` now defaults to `n` (§12.1, README
-  "Split keyboard limitations").** Revisit that Kconfig default once the
-  round-trip is actually verified working on real hardware.
-
-Every phase: run `python3 -m unittest` inside the nix devshell
-(`nix --extra-experimental-features 'nix-command flakes' develop
-/home/ubuntu/zmk-workspace/nix --command bash -lc '…'`), commit at
-milestones, `SKIP=prettier,eslint,jest,web-build pre-commit run --all-files`
-(web hooks are broken in the devshell — run npm equivalents directly).
-Read `skills/zmk-module-dev/SKILL.md` in-repo and
-`/home/ubuntu/zmk-workspace/skills/develop-zmk-module/SKILL.md` before coding.
-
-## 14. Risks / open points (decide during implementation, don't redesign)
-
-- native_sim settings backend selection (file vs NVS+flash_sim) — copy
-  whatever zmk-feature-custom-settings' native_sim tests use.
-- Exact `boot_ordinal` bookkeeping (§6) — any scheme with ≤1 extra small
-  settings write per persisted incident is acceptable.
-- Feed-work starvation false positives if a user work item legitimately
-  blocks a queue > timeout (e.g. long flash erase in settings) — if hardware
-  validation shows this, raise the default timeout; do not add suppression
-  logic in v1.
-- `__noinit` may land in a RAM area the Adafruit UF2 bootloader scrubs —
-  hardware Phase F explicitly verifies survival across `sys_reboot`; if it
-  fails, switch to a devicetree `zephyr,retained-ram` region at top of SRAM
-  (API-compatible change confined to `watchdog_pending.c`).
+# Watchdog design
+
+## Capture and monitoring
+
+The store, capture paths and transport adapters have separate responsibilities.
+Each split half owns its incident store. Capture publishes a retained-RAM record;
+later boot work persists it. Studio RPC and split relay read that store without
+making it depend on either transport.
+
+Minimal and enriched common captures share one envelope initializer. Its
+explicit timed/untimed mode keeps minimal publication free of clock access.
+Operation entry size/count/offset and relay fragment size/count/completion mask
+are named once; compile-time checks bind them to the record/protobuf capacity.
+Relay FIFO depth derives from a maximal page, preserving the 21-event bound.
+Offline decoding separates metadata/identity validation, candidate collection,
+and external ELF lookup; CLI input/output and refusal rules remain unchanged.
+
+Monitoring arms at APPLICATION initialization after the system and ZMK
+low-priority workqueues exist, so a queue that has already stopped cannot
+prevent it. Each monitored queue feeds its own task-watchdog channel twice per
+timeout. Runtime status reports registration/scheduling failures.
+
+Fatal and freeze capture share a nonblocking entry guard and fixed records.
+They publish minimal reason or queue/channel evidence before optional clock,
+name, register or stack collection. Nested capture reboots without replacing
+the outer record. Capture performs no Flash write, allocation or module-lock
+wait. The kernel fault-entry, clock/name access and SoC reboot paths remain
+external boundaries; arbitrary corrupted kernel state is not made safe.
+
+The software timer must still execute for freeze detection to recover a queue
+stall. task_wdt_init(NULL) supplies no hardware watchdog. A CPU, interrupt or
+clock-wide stop can prevent capture and restart. IRQ priority or successful
+compilation cannot establish physical radio/reset behavior.
+
+### Cortex-M trace
+
+On supported single-core Cortex-M3/M4 configurations without userspace, capture
+examines the monitored queue's thread, not whichever thread the timer interrupted.
+It validates SRAM/thread bounds and scans at most 1024 bytes for six code-address
+candidates. Saved PC/LR and BL/BLX-compatible words are candidates, not an unwind.
+FP/alignment exclusions remain explicit; other architectures retain queue/time
+detection without a stack scan. Fatal ESF reads check alignment and SRAM bounds.
+
+The optional 36-byte FreezeDetail.trace is little-endian: format, thread state,
+flags and address count occupy bytes 0..3; wait queue and SP occupy 4..11;
+six u32 address slots occupy 12..35. Consumers must validate the format/count.
+
+## Pending conversion and reset audit
+
+Pending publication invalidates an atomic marker before updating content, then
+publishes CRC and the marker after a completed record. CRC includes its sequence.
+Boot conversion waits for settings readiness and serializes converters. A storage
+failure retains the record and retries with bounded one-second to one-minute
+backoff. Successful append or the documented full-store drop clears it; repeated
+conversion cannot clear a newer published record or repeatedly count that drop.
+
+A reset between successful Flash append and RAM clear can repeat an incident.
+Power loss or bootloader writes can erase retained RAM. This is not an exactly-once
+physical transaction. Reset audit preserves interesting cause bits on read/save
+errors, retries clearing after persistence, and avoids duplicate append when
+only clearing failed. Pending, invalid-pending and persistence/audit errors appear
+in live runtime status, separately from incident history.
+
+## Storage and compatibility
+
+Version 4 records are 336 packed bytes; Flash slots add a four-byte ID header.
+The first 144 bytes retain the v3 layout. The loader accepts exact v1/44,
+v2/68, v3/148 and v4/340 version/slot-length pairs without
+rewriting history. Unknown kinds, corrupt lengths and malformed keys reject
+without cache mutation. The 80-byte diagnostic extension and fatal context are
+zeroed on v1/v2 loads. The new 192-byte common extension is zero on v1-v3
+loads, and an old reserved flag cannot claim that extension. Existing records
+are neither rewritten nor renumbered. The store costs 192 additional RAM bytes
+per configured slot; protocol buffers and capture state add fixed costs. Check
+the selected firmware's linked RAM/Flash totals separately.
+
+The incident ordinal increments per persisted incident, not per boot. Incident
+and metadata writes are separate operations. Settings commit advances a stale
+RAM ordinal beyond retained records using modulo-32-bit ordering before recording
+resumes. IDs remain unique among retained records despite metadata failure or
+uint16 wrap; deleted or evicted IDs can eventually be
+reused. Legacy duplicate IDs remain enumerable but reject ambiguous by-ID access
+or deletion. Full stores drop/count new incidents without overwriting history,
+unless `CONFIG_ZMK_WATCHDOG_OVERWRITE_OLDEST` is set: then an incident at or after
+`CONFIG_ZMK_WATCHDOG_OVERWRITE_MIN_UPTIME_S` of its boot replaces the stored incident with
+the lowest persisted ordinal (compared modulo 2^32); the old record stays if the write
+fails, IDs keep increasing, and an earlier incident is dropped as above. A positive
+minimum uptime suppresses replacement by earlier crash-loop incidents in a full
+store. Zero intentionally permits immediate replacement. This is an incident-age
+gate, not a global Flash write-rate or wear guarantee; free slots and multiple
+qualifying appends are separate cases.
+Partial delete failure keeps failed records and successful deletions for retry.
+
+Settings readiness comes from the module's h_commit. Writers do not hold the
+RAM mutex across settings I/O. Append callbacks run outside module locks. Status
+reads take one coherent RAM snapshot. Fixed record strings are bounded before RPC
+encoding, including records whose name field has no terminating NUL.
+
+Record flag bit 0 marks valid Cortex-M fatal context (r0-r3, r12, xPSR).
+Bit 1 marks minimal/incomplete capture; its uptime is unavailable, not evidence
+of a zero-second incident. Incident.capture_flags and RelayIncidentCore.capture_flags
+use additive protobuf field 10. Existing field numbers stay unchanged and no
+64-bit protobuf types are used. Bit 2 marks the additive common capture extension
+in Incident field 11. This flag is independent of the fatal ESF-valid flag.
+
+### Common CPU and operation evidence
+
+The shared recorder does not depend on a BLE/controller-specific structure.
+`ZMK_WATCHDOG_CAPTURE_CONTEXT` defaults on with diagnostics and adds the same
+extension to fatal and freeze capture. Minimal publication snapshots completed
+metadata operations before reading clocks, thread names or exception pointers.
+Minimal capture has no capture-time capability; a zero timestamp is not an age.
+
+Format 1 is exactly 192 little-endian bytes:
+
+| Bytes | Meaning |
+| --- | --- |
+| 0..3 | Format 1, flags, code-address count <= 6, operation count <= 4 |
+| 4..15 | Capture milliseconds, assertion call site and source line |
+| 16..31 | Checked scan/target SP, MMFAR, BFAR and ICSR |
+| 32..63 | r4-r11, only when the callee-valid flag is set |
+| 64..87 | Six code-address candidate slots |
+| 88..95 | Dropped metadata writes; capability bit 0 means capture time is available |
+| 96..191 | Four 24-byte entries: sequence/time/site u32, domain/event u16, arg0/arg1 u32 |
+
+Flags are partial/bounded (bit 0), callee-valid (1), fault-registers-present (2),
+checked stack (3), assertion origin (4), unsupported CPU capture (5), and
+interrupted ISR (6). MMFAR/BFAR contents are meaningful only with the matching
+CFSR validity bits. Register payloads may contain application data and keep the
+existing secured retrieval boundary. Code candidates are not an unwind.
+
+On Cortex-M3/M4, EXTRA_EXCEPTION_INFO supplies saved r4-r11. Every pointer and
+read length is checked against SRAM bounds. A copied software-oops ESF can omit
+its original MSP and EXC_RETURN; capture does not infer an interrupt stack from
+that copy. Unknown/extended FP frames are not scanned. A checked thread PSP can
+scan at most 1024 stack bytes for up to six call-compatible code addresses, and freeze
+capture retains the existing target-thread trace. Other architectures retain
+metadata with the unsupported CPU flag. Wide native code pointers are reported
+as unavailable rather than silently narrowed into plausible 32-bit addresses.
+
+`zmk_watchdog_operation()` is a noinline public metadata API. Its call site,
+numeric owner domain/event and two full-width values are recorded with sequence
+and time; `_at` accepts an explicitly known call site for adapters. Domains are
+owner-defined; domain 0 is reserved and domain 1 is the BLE
+adapter. BLE arg0 packs handle16/role8/profile8, with 255 for unmatched profiles;
+arg1 holds its event value. These are observations, not a peer identity or proof
+that a particular link caused a later failure. Do not record text, key material
+or peer addresses. Four entries are a bounded metadata window, not every
+instruction or enough input to automatically replay arbitrary failures.
+
+Writers try an atomic guard and publish an inactive buffer. Interrupted writers
+are counted; readers retry at most twice and never wait for the interrupted
+writer. Eviction remains visible across sequence wrap. The assertion adapter
+wraps `assert_post_action` and forwards the original action exactly once. A
+clock read before forwarding could deadlock an assertion inside clock code, so
+the adapter publishes only its atomic origin; minimal capture retains it before
+reading a clock or calling the ordinary metadata recorder. A
+returning test action clears its origin, avoiding stale attribution. Assertions
+that bypass this hook still reach the ordinary fatal handler; the wrapper does
+not change their severity or claim that all assert macros share one hook.
+
+## Operation diagnostics and build identity
+
+Diagnostic format 1 occupies 80 bytes, with little-endian integer fields:
+
+| Bytes | Meaning |
+| --- | --- |
+| 0..3 | Format 1, count up to seven, flags, observer capabilities |
+| 4..7 | 32-bit firmware tag |
+| 8..11 | Cached active profile, endpoint, USB state, observed BLE links |
+| 12..15 | Dropped writer events |
+| 16..23 | CFSR/HFSR, valid only with diagnostic flag bit 2 |
+| 24..79 | Seven entries: u32 uptime_ms, u8 event, u8 profile, u16 value |
+
+Diagnostic flags mark evicted history (bit 0), partial/inconsistent snapshot
+(bit 1) and valid fault status (bit 2). Capability bit 0 marks the BLE adapter.
+Unknown cached values/profile are 255; profile indices are zero-based. Event IDs
+are defined in include/cormoran/zmk/watchdog_diagnostics.h. Return-error values
+use two's-complement u16. Values have event-specific meanings. Uptime wraps after
+about 49.7 days; preserve capture order instead of sorting timestamps.
+
+Try-writers update an inactive RAM buffer and publish a complete checkpoint.
+Fault readers never wait for an interrupted writer. Thread readers retry at most
+twice, then report a partial snapshot. A PRE_KERNEL_2 hook validates retained
+sequence/CRC/commit markers and copies the most recent completed previous-boot
+checkpoint before starting fresh history. Interrupted writes retain the other
+complete slot; invalid checkpoints are not presented as valid. SMP is gated off.
+
+Previous checkpoints are boot evidence, not new incidents or a stopped CPU PC.
+A normal pin reset can produce one too. Copy before another reset; retention
+across power loss, reflash or arbitrary memory corruption is not guaranteed.
+The BLE adapter records public operations/cached state without keys or peer
+addresses. Linker wrappers forward the original call once with its parameters
+and result. Calls inside the defining object can bypass GNU ld --wrap.
+Fatal registers can contain application data; diagnostic RPC is secured by default.
+
+### Live runtime flags
+
+StatusResponse.runtime_flags uses stable bits defined in the diagnostic header:
+
+| Bits | Meaning |
+| --- | --- |
+| 0..2 | Metadata supported, fatal enabled, freeze enabled |
+| 3..5 | System armed, low-priority armed, registration/feed scheduling failure |
+| 6..9 | Reset cause available, previous checkpoint available, corrupt checkpoint, software-only |
+| 10..13 | Pending retained, pending invalid, persistence failed, reset audit failed |
+| 14..15 | Common capture enabled, assertion call-site adapter enabled |
+
+Armed reports successful channel/feed registration, not CPU-wide recovery.
+Build configuration tags, source/config digests and core revisions are recorded
+separately. A Zephyr or ZMK checkout that git cannot read records its revision as
+`unknown` rather than failing the build. A tag is not a unique binary identifier: package the matching ELF and
+verify its full SHA-256 before decoding addresses with tools/decode_trace.py.
+
+## Retired performance measurement
+
+The scheduler/input/BLE samplers, health history and corresponding configuration
+and UI were removed on 2026-10-16. Freeze feeds only monitor queue progress.
+The legacy health protobuf field numbers and names are `reserved`. An old
+client's GetHealth request decodes as no request and gets the ordinary
+unsupported-request error locally; it is never relayed and samples nothing.
+Source/tests and historical acceptance gaps are retained externally; see
+[the retirement map](tests/retired-measurements.md). USB telemetry is separate
+and on hold. Fault/reset evidence and its limitations remain unchanged.
+
+## Studio RPC, split relay and client
+
+Incident notifications follow the same default Studio unlock requirement as
+diagnostic requests. Locked incidents remain stored for later retrieval; they
+are not queued for notification on unlock. Authorization is checked before
+creating a notification and again before payload encoding after any transport
+wait. The first encoder pass commits that decision for both nanopb sizing and
+output. Revocation before that pass omits the payload successfully, preserving
+the core's already-started frame. An authorized notification committed at sizing
+finishes even if locking occurs before output; later notifications are stopped.
+The explicit `ZMK_WATCHDOG_STUDIO_RPC_UNSECURED` option also applies to live
+notifications; enabling it intentionally exposes diagnostic data while locked.
+A relayed peripheral answer is notified through the same path, so an answer
+that arrives after locking is not sent either.
+
+The transport-independent executor handles local status, listing and deletion.
+Studio responses stream through the existing TX ring buffer. Each half compiles
+only its side of the relay: the central sends requests and accepts answers, a
+peripheral accepts requests and sends answers. Monitoring/capture never polls
+or synchronizes split stores. Only explicit Studio requests enter the relay.
+The selected core exposes broadcast relay without a targeted send API; the
+peripheral cannot determine its central-side slot. The adapter therefore accepts
+source 1 only with exactly one configured peripheral, rejecting other sources
+and multiple-peer requests before send. This prevents a targeted delete from
+executing on unrelated peers and avoids interleaved pages in the single bounded
+assembler. Local source 0 still executes locally in every configuration.
+The existing wdq envelope is sent through the core API directly so encoding or
+transport failures return an ErrorResponse instead of a deferred acknowledgement.
+Nonzero correlation IDs use an atomic counter and skip zero on uint32 wrap.
+Replies carry source/request ID. Indexed pages carry expected count
+and diagnostic extensions separately from the record core. Common context uses
+three ordered 64-byte fragments per incident, tied to page index, ID, source and
+request. Missing, repeated, wrong-size or out-of-order required fragments reject
+the page. A bounded 21-event FIFO handles a maximal four-record page burst
+without raising the 128-byte payload bound. Full page/response storage remains
+worker-owned static state rather than consuming its production-sized stack.
+The assembler rejects incomplete pages, missing required extensions and mismatched
+source/request/ID, while legacy ordered pages remain readable.
+
+The client subscribes before sending a relay request and matches source plus
+request ID. RPC acknowledgement has a 15-second deadline; acknowledged relay
+response has a separate three-second deadline. Abort/deadline cleanup releases
+listeners. Retrieval generations reject old connection/source/deletion results.
+Partial reports retain received/expected counts and errors; copy preserves raw
+bytes, duplicate legacy IDs and response order. Clipboard failure stays separate
+from retrieval failure. Missing peripherals can time out; encoding tests cannot
+establish physical split congestion or reconnect delivery.
+
+Test injection defaults off. Another selected strong fatal handler conflicts at
+link time; verify the final ELF's handler and disabled injection hooks. See
+[module tests](tests/README.md) and [client checks](web/README.md) for executable
+regressions and the boundary between software checks and board acceptance.

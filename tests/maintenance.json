@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "owner": "zmk-watchdog-fork",
+  "supported_cores": ["dya"],
+  "unsupported_core_status": "NOT APPLICABLE",
+  "commands": [
+    "python3 -m unittest discover -v -s tests -p test_owner.py",
+    "python3 tests/relay-central/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT; single/multiple capacity, rejected targets, transport errors, nonzero ID wrap, identical binaries three times",
+    "python3 tests/context/run.py --zephyr RESOLVED_ZEPHYR --output FRESH_ABSOLUTE_OUTPUT; two native variants three times; missing-publication and assert-clock controls each rejected three times",
+    "python3 tests/trace/run.py --workspace RESOLVED_WORKSPACE --artifacts FRESH_OUTPUT; repeat with --assert-context and another fresh output, same Cortex-M ELF three times per variant",
+    "bash tests/run-web.sh",
+    "python3 -m unittest discover -v -s tests/decoder; retain primary evidence and raw optional captures on per-record errors, reject invalid report shapes and continue after malformed incidents/details; preserve ELF/build-tag refusal",
+    "python3 tests/relay-stack/run.py --zephyr ZEPHYR --cmsis CMSIS --nanopb NANOPB --zmk RESOLVED_DYA --artifacts NEW_OUTPUT; real Cortex-M peripheral relay stack boundary, also in test_owner.",
+    "python3 -m unittest discover -s tests -p test_retirement.py -v"
+  ],
+  "coverage_map": "tests/README.md",
+  "collector": "tests/support/qemu_capture.py plus tests/test_qemu_capture.py: every terminal-record prefix, delayed suffix, EOF and timeout; raw ordered logs and unchanged kernel assertions.",
+  "unsecured_fixture": "tests/studio_unsecured reuses the complete canonical Studio C assertions; default secured and explicit unsecured registry/notification expectations both execute.",
+  "mutation_fixture": "tests/store/mutate_overwrite.py preserves all ten overwrite controls with exactly-once selectors, capacities16/1, raw evidence and compile-failure rejection.",
+  "preserved_assertions": "Relocated fixtures retain their prior assertions; no snapshot auto-accept or unique assertion removal.",
+  "execution": {
+    "quick": "All behavioral scenarios once; sanitizer variants where supported.",
+    "full": "Same scenarios plus relevant optimization, ABI, role, kernel and supported-core checks.",
+    "outputs": "Use a fresh evidence directory; existing evidence is never overwritten."
+  },
+  "gaps": [
+    "Physical USB/BLE/split delivery, timing, power and retention require matching production-board evidence.",
+    "The relay-stack fixture exercises actual DYA event dispatch with a declared 344-byte downstream stack budget and serialized worker response storage. This model does not establish actual BT/radio delivery or kernel worst-case stack use. Physical retrieval histories remain private; congestion, power and long-run acceptance require matching production-board evidence.",
+    "Performance/health measurement retired; source and unique assertions archived per tests/retired-measurements.md. No new physical verdict."
+  ],
+  "native_verification": "tests/native_verifier.py: actual exit, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times.",
+  "identity_dependencies": "tests/decoder/test_build_identity.py: selected peripheral context header belongs to the digest and CMake configure dependencies; a header-only edit regenerates identity; central/disabled selections stay independent.",
+  "timeout_width": {
+    "entry": "python3 -m unittest discover -s tests -p test_timeout_width.py -v",
+    "contract": "Full uint32 milliseconds, exact ceiling and configured kernel tick ABI; independent wide oracle and identified math/width controls",
+    "physical": "NOT RUN"
+  }
+}
