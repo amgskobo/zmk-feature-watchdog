@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - codex/watchdog-review
     paths-ignore:
       - "**/*.md"
       - .github/workflows/copilot-setup-steps.yml
