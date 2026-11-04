@@ -237,21 +237,28 @@ static void stream_incident_page(uint32_t request_id,
 /* Execution (store reads, protobuf encode) runs on the low-priority queue,
  * not on the system work queue that raises the relayed event, so the payload
  * is copied out of the listener. */
-static struct zmk_watchdog_relay_request watchdog_relay_pending_request;
+/* k_work submissions coalesce; keep each admitted request's bytes in a FIFO. */
+#define WATCHDOG_RELAY_PENDING_REQUESTS 4
+K_MSGQ_DEFINE(watchdog_relay_requests, sizeof(struct zmk_watchdog_relay_request),
+              WATCHDOG_RELAY_PENDING_REQUESTS, 4);
 
 static void watchdog_relay_process_work_handler(struct k_work *work) {
-    uint32_t request_id;
+    /* Only the worker uses this copy while execution/transport can block. */
+    static struct zmk_watchdog_relay_request request;
     /* Static, not on the 2 KiB queue stack: the response stays alive through
      * the synchronous event and BLE dispatch below. Only this serialized work
      * item uses it, and the executor resets it for every request. */
     static cormoran_watchdog_Response resp;
-    zmk_watchdog_breadcrumb(ZMK_WDG_RELAY_EXEC_BEGIN, 255, watchdog_relay_pending_request.size);
-    LOG_INF("relay exec begin bytes=%u", watchdog_relay_pending_request.size);
-    int ret = watchdog_relay_exec_request(watchdog_relay_pending_request.payload,
-                                          watchdog_relay_pending_request.size, &request_id, &resp);
+    if (k_msgq_get(&watchdog_relay_requests, &request, K_NO_WAIT) != 0) {
+        return;
+    }
+    uint32_t request_id;
+    zmk_watchdog_breadcrumb(ZMK_WDG_RELAY_EXEC_BEGIN, 255, request.size);
+    LOG_INF("relay exec begin bytes=%u", request.size);
+    int ret = watchdog_relay_exec_request(request.payload, request.size, &request_id, &resp);
     if (ret < 0) {
         LOG_WRN("relay exec decode err=%d", ret);
-        return;
+        goto next_request;
     }
     zmk_watchdog_breadcrumb(ZMK_WDG_RELAY_EXEC_END, 255, resp.which_response_type);
     LOG_INF("relay exec done id=%u kind=%u", request_id, resp.which_response_type);
@@ -260,7 +267,7 @@ static void watchdog_relay_process_work_handler(struct k_work *work) {
         stream_incident_page(request_id, &resp.response_type.incident_page);
         zmk_watchdog_breadcrumb(ZMK_WDG_RELAY_WORK_END, 255, resp.which_response_type);
         LOG_INF("relay page send returned id=%u", request_id);
-        return;
+        goto next_request;
     }
 
     cormoran_watchdog_RelayResponse relay_resp =
@@ -272,9 +279,52 @@ static void watchdog_relay_process_work_handler(struct k_work *work) {
     raise_relay_response(&relay_resp);
     zmk_watchdog_breadcrumb(ZMK_WDG_RELAY_WORK_END, 255, resp.which_response_type);
     LOG_INF("relay response send returned id=%u", request_id);
+
+next_request:
+    /* One request per invocation lets already-queued watchdog feed work run.
+     * Zephyr permits submitting a running item: it queues another invocation
+     * on this same queue, without reentering the handler. Submissions coalesce.
+     * If admission races this empty check, the listener submits its own wakeup;
+     * otherwise our submission retains all requests already in the FIFO. */
+    if (k_msgq_num_used_get(&watchdog_relay_requests) != 0) {
+        k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), work);
+    }
 }
 
 K_WORK_DEFINE(watchdog_relay_process_work, watchdog_relay_process_work_handler);
+
+/* Queue refusal must remain correlated with the central's Deferred ID. Decode
+ * only that bounded envelope; no store access or large response is needed. */
+static void watchdog_relay_refuse_full(const struct zmk_watchdog_relay_request *request) {
+    if (request->size > sizeof(request->payload))
+        return;
+    pb_istream_t input = pb_istream_from_buffer(request->payload, request->size);
+    uint32_t request_id = 0;
+    while (input.bytes_left) {
+        pb_wire_type_t wire;
+        uint32_t tag;
+        bool eof;
+        if (!pb_decode_tag(&input, &wire, &tag, &eof))
+            return;
+        if (tag == cormoran_watchdog_RelayRequest_request_id_tag) {
+            if (wire != PB_WT_VARINT || !pb_decode_varint32(&input, &request_id))
+                return;
+        } else if (!pb_skip_field(&input, wire)) {
+            return;
+        }
+    }
+    if (request_id == 0)
+        return;
+    cormoran_watchdog_RelayResponse response = cormoran_watchdog_RelayResponse_init_zero;
+    response.request_id = request_id;
+    response.which_relay_response_type = cormoran_watchdog_RelayResponse_response_tag;
+    cormoran_watchdog_RelayNonListResponse *result = &response.relay_response_type.response;
+    result->which_relay_non_list_response_type = cormoran_watchdog_RelayNonListResponse_error_tag;
+    snprintf(result->relay_non_list_response_type.error.message,
+             sizeof(result->relay_non_list_response_type.error.message),
+             "Watchdog relay busy; retry the request");
+    (void)raise_relay_response(&response);
+}
 
 static int on_watchdog_relay_request(const zmk_event_t *eh) {
     const struct zmk_watchdog_relay_request *ev = as_zmk_watchdog_relay_request(eh);
@@ -282,7 +332,10 @@ static int on_watchdog_relay_request(const zmk_event_t *eh) {
         return 0;
     }
 
-    watchdog_relay_pending_request = *ev;
+    if (k_msgq_put(&watchdog_relay_requests, ev, K_NO_WAIT) != 0) {
+        watchdog_relay_refuse_full(ev);
+        return 0;
+    }
     k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &watchdog_relay_process_work);
     return 0;
 }

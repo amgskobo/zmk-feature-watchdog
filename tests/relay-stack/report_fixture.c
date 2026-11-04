@@ -32,9 +32,13 @@ static int report_tick(void) {
     return remaining;
 }
 
+int report_initial_deadline(void) {
+    CHECK(k_ticks_to_ms_floor32(k_work_delayable_remaining_get(&boot_report_work)) >= 4900);
+    return failures;
+}
+
 int report_cases(void) {
     struct k_work_sync sync;
-    CHECK(k_ticks_to_ms_floor32(k_work_delayable_remaining_get(&boot_report_work)) >= 4900);
     k_work_cancel_delayable_sync(&boot_report_work, &sync);
     reads = 0;
     store_ready = false;

@@ -12,7 +12,17 @@ nanopb_generate_cpp(proto_srcs proto_hdrs RELPATH ${OWNER}
 if(NOT ZMK_ROOT)
     message(FATAL_ERROR "ZMK_ROOT must identify the resolved unchanged DYA checkout")
 endif()
-target_sources(app PRIVATE main.c report_fixture.c ${OWNER}/src/studio/watchdog_request_exec.c
+if(WATCHDOG_RELAY_FAIRNESS)
+    target_sources(app PRIVATE fairness.c ${OWNER}/src/watchdog_freeze.c
+        ${OWNER}/src/watchdog_trace.c ${OWNER}/src/watchdog_capture.c)
+    target_compile_definitions(app PRIVATE CONFIG_WATCHDOG_RELAY_FAIRNESS_TEST=1
+        CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS=100
+        CONFIG_ZMK_WATCHDOG_FREEZE_MONITOR_LOWPRIO_QUEUE=1)
+    zephyr_link_libraries(-Wl,--wrap=task_wdt_add -Wl,--wrap=task_wdt_feed)
+else()
+    target_sources(app PRIVATE main.c report_fixture.c)
+endif()
+target_sources(app PRIVATE ${OWNER}/src/studio/watchdog_request_exec.c
     ${OWNER}/src/split/watchdog_relay_page.c ${ZMK_ROOT}/app/src/event_manager.c ${proto_srcs})
 zephyr_linker_sources(RODATA ${ZMK_ROOT}/app/include/linker/zmk-events.ld)
 target_include_directories(app PRIVATE ${ZMK_ROOT}/app/include ${OWNER}/include ${CMAKE_CURRENT_BINARY_DIR}

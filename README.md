@@ -9,7 +9,7 @@ Keep the module's documented imports enabled where required. The original
 upstream installation examples below describe the upstream repository.
 
 The dependency manifests select the available Custom Settings revision
-`b91a8ceb0a57a0cf41b34270752d79463e2848fa` from its reviewed fork;
+`c4071b095c3007d1deb055c609603ca9b5897d14` from its reviewed fork;
 production imports and isolated tests use the same registry implementation.
 
 Records workqueue freezes, fatal errors and selected reset causes. Each split
@@ -115,6 +115,25 @@ send failure returns an error; an accepted request with no answer times out.
 Replies use source/request ID. Nonempty indexed pages/extensions must be complete, within the existing
 128-byte event bound. Studio responses stream without enlarging TX buffers.
 Historical rig checks do not establish current production acceptance.
+
+The peripheral retains four pending relay requests in a FIFO and executes them
+serially with a separate worker-owned input. Each invocation executes one
+request and returns to its queue, letting queued freeze-feed work run before
+the next invocation. A single request's synchronous transport wait is still
+subject to the recovery boundaries above. A full FIFO returns a busy error
+with the refused request's ID; accepted requests never replace each other's
+bytes. Queue storage is four request structs plus kernel queue metadata, with
+no new thread, heap or periodic work. An individual Delete verifies its result
+and count and reports when no incident was deleted; refreshed history remains
+available for a later retry.
+
+Studio locking clears the client's incident/status display and retires pending
+reads and deletions. Unlock starts a fresh retrieval; a previous response cannot
+restore the retired view. Local replies and relay acknowledgements have a
+15-second collection budget, configured explicitly in the pinned SDK. A deferred
+peripheral answer has a separate three-second budget after acknowledgement.
+Client cancellation retires results and listeners; it cannot retract an operation
+already sent to firmware.
 
 ## Development
 

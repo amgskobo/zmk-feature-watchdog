@@ -30,10 +30,17 @@ Refresh fetches status then ordered four-record pages. Interrupted/changed pages
 remain incomplete, with received/expected counts and the error in the copied
 report. Raw timestamps, duplicate legacy IDs and diagnostic/context/trace bytes
 remain in received order. An old connection/source result cannot replace current
-results. Clipboard errors are separate from retrieval errors.
+results. Locking clears status/history, confirmation and copy feedback, aborts
+pending collections and retires their authorization lifetime. Unlock reads a
+fresh view, even if lock/unlock notifications arrive together; old responses or
+deletion continuations cannot revive it. Clipboard errors are separate from
+retrieval errors. Client cancellation cannot retract a firmware request already
+sent or cancel an in-progress operating-system clipboard operation.
 
 Peripheral responses are subscribed before a request is sent and matched by
-source plus request ID. RPC acknowledgement is bounded at 15 seconds; an
+source plus request ID. Local response/RPC acknowledgement is bounded at 15
+seconds, explicitly passed as `callRPC(payload, { timeout: 15000 })` to the
+package-lock-pinned SDK; its unconfigured default is five seconds. An
 acknowledged relay response has a separate 3-second budget. Missing peripherals
 can time out. These are client bounds, not physical split delivery guarantees.
 
@@ -49,7 +56,10 @@ Use `npm run dev` for local development. Generated types follow
 Tests, watch/coverage modes, development and builds generate these types before use.
 The app uses the package-lock-resolved Studio hook/client. Tests exercise relay
 ordering/abort/deadline cleanup, reconnect stale results, partial pages and copied
-evidence with controlled transports. They do not establish physical BLE/USB.
+evidence with controlled transports. Authorization/deadline tests keep the
+actual pinned `ZMKCustomSubsystem` timer and control only the lower `call_rpc`
+result, including six-second success and fifteen-second timeout/retry. They do
+not establish physical BLE/USB.
 
 Copy diagnostic report produces `zmk-watchdog-report-v1`. Decode addresses with
 [the offline tool](../tools/decode_trace.py), after verifying the exact ELF against

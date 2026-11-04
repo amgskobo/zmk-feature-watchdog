@@ -221,6 +221,24 @@ class WestCommandsTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(
+        platform.system() == "Linux", "real kernel fairness requires Linux/QEMU"
+    )
+    def test_relay_fairness(self):
+        command = ["python3", "tests/relay-stack/run.py", "--fairness"]
+        for name in ("zephyr", "cmsis", "nanopb", "zmk"):
+            path = run_west(["list", name, "-f", "{abspath}"])
+            self.assertEqual(path.returncode, 0, path.stderr)
+            command += ["--" + name, path.stdout.strip()]
+        command += ["--artifacts", str(self.BUILD_DIR / "relay-fairness")]
+        result = subprocess.run(command, cwd=THIS_DIR, capture_output=True, text=True)
+        (self.BUILD_DIR / "test_relay_fairness.log").write_text(
+            result.stdout + result.stderr, encoding="utf8"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("FAIRNESSCASE replenished"), 3)
+        self.assertEqual(result.stdout.count("FAIRNESSCASE real-stall"), 3)
+
     def test_zmk_build(self):
         self._test_zmk_build(
             {

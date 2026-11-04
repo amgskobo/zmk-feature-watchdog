@@ -79,7 +79,7 @@ jobs:
       - name: Test
         run: OWNER_TEST_OUTPUT="$PWD/owner-test-output" python3 -m unittest discover -v -s tests -p test_owner.py
       - name: Upload Build Artifacts
-        if: always()
+        if: ${{ (always()) && github.ref != 'refs/heads/codex/watchdog-review' }}
         uses: actions/upload-artifact@v4
         with:
           name: zmk-firmware

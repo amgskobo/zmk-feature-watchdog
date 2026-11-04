@@ -252,6 +252,19 @@ assembler. Local source 0 still executes locally in every configuration.
 The existing wdq envelope is sent through the core API directly so encoding or
 transport failures return an ErrorResponse instead of a deferred acknowledgement.
 Nonzero correlation IDs use an atomic counter and skip zero on uint32 wrap.
+The peripheral copies admitted requests into four fixed FIFO slots. Its one
+worker executes one per invocation using a separate current input, including
+arrivals while a response is blocked in transport. Remaining entries resubmit
+the running work item to its queue tail; Zephyr serializes and coalesces such
+submissions. Admission always submits after copying, so an arrival racing the
+worker's empty check supplies its own wakeup. Decode failure and page/non-list
+completion all use this resubmission path. Returning between requests permits
+queued freeze-feed work to run; a single unbounded core transport wait remains
+outside this fairness guarantee. Queue exhaustion emits a correlated
+non-list busy error without store access. Malformed/unidentifiable envelopes
+cannot supply a valid refusal ID. FIFO payload storage is four request structs,
+plus kernel queue metadata; the existing current input remains worker-owned.
+Central admission/correlation and response FIFO/page/transport bounds are unchanged.
 Replies carry source/request ID. Indexed pages carry expected count
 and diagnostic extensions separately from the record core. Common context uses
 three ordered 64-byte fragments per incident, tied to page index, ID, source and
@@ -263,9 +276,18 @@ The assembler rejects incomplete pages, missing required extensions and mismatch
 source/request/ID, while legacy ordered pages remain readable.
 
 The client subscribes before sending a relay request and matches source plus
-request ID. RPC acknowledgement has a 15-second deadline; acknowledged relay
+request ID. Local response/RPC acknowledgement has a 15-second deadline, passed
+explicitly through the selected SDK's supported timeout option rather than
+its five-second default; acknowledged relay
 response has a separate three-second deadline. Abort/deadline cleanup releases
-listeners. Retrieval generations reject old connection/source/deletion results.
+listeners. Lock notification synchronously retires the authorization lifetime,
+aborts its pending collections and removes its displayed evidence. Every lock
+transition has a new lifetime, including a batched lock/unlock. Unlock reloads
+fresh status/history. Late replies, relay broadcasts and mutation continuations
+retain their retired lifetime and cannot restore that view or start follow-up
+requests. The SDK's underlying RPC may finish after cancellation, and an already
+sent firmware mutation cannot be recalled. Retrieval generations additionally
+reject old connection/catalog/source/deletion results.
 Partial reports retain received/expected counts and errors; copy preserves raw
 bytes, duplicate legacy IDs and response order. Clipboard failure stays separate
 from retrieval failure. Missing peripherals can time out; encoding tests cannot

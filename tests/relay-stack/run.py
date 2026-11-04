@@ -21,6 +21,11 @@ def main():
     for name in ("zephyr", "cmsis", "nanopb", "zmk", "artifacts"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument(
+        "--fairness",
+        action="store_true",
+        help="Run the production freeze monitor against a continuously replenished relay FIFO",
+    )
+    parser.add_argument(
         "--mute-info-negative-control",
         action="store_true",
         help="Mute production INFO; the log contract must fail, without source rewriting",
@@ -83,6 +88,13 @@ def main():
     ]
     if args.mute_info_negative_control:
         command.append("-DWATCHDOG_LOG_LEVEL=0")
+    if args.fairness:
+        command.extend(
+            [
+                "-DWATCHDOG_RELAY_FAIRNESS=ON",
+                "-DEXTRA_CONF_FILE=" + str(root / "tests/relay-stack/fairness.conf"),
+            ]
+        )
     (output / "command.json").write_text(json.dumps(command, indent=2))
     with (output / "build.log").open("w") as stream:
         result = subprocess.run(
@@ -144,12 +156,14 @@ def main():
                     process.terminate()
                 process.wait(timeout=5)
         text = raw.read_text(errors="replace") if raw.exists() else ""
-        passed = (
-            complete_terminal_record(text)
-            and "RESULT: PASS failures=0" in text
-            and text.count("CASE seq=") == 7
-        )
+        passed = complete_terminal_record(text) and "RESULT: PASS failures=0" in text
         checks = [
+            text.count("CASE seq=") == 7,
+            text.count("REQUESTCASE ") == 4,
+            "REQUESTCASE queued-two ordered_ids=110,111" in text,
+            "REQUESTCASE running-three ordered_ids=201,202,203" in text,
+            "REQUESTCASE full correlated_busy=404 recovered=405" in text,
+            "REQUESTCASE malformed-page-tail page=501 packets=9 status=502" in text,
             text.count("REPORTCASE ") == 3,
             "CONTEXT_RELAY_COMPLETE records=4 fragments=12 packets=21" in text,
             "PASS: watchdog_common_context_relay_controls=8" in text,
@@ -166,6 +180,13 @@ def main():
             "69726576" not in text and "20686375" not in text,
             "history complete attempted=6" in text,
         ]
+        if args.fairness:
+            checks = [
+                text.count("FAIRNESSCASE ") == 2,
+                "FAIRNESSCASE replenished responses=" in text,
+                " freezes=0" in text,
+                "FAIRNESSCASE real-stall detected=1 recovered_feed=1" in text,
+            ]
         passed = passed and all(checks)
         trials.append(
             dict(
@@ -175,12 +196,15 @@ def main():
                 command=command,
                 checks=checks,
                 negative_control=args.mute_info_negative_control,
+                fairness=args.fairness,
                 elf_sha256=hashlib.sha256(elf.read_bytes()).hexdigest(),
             )
         )
         print(f"Trial {trial}: {'PASS' if passed else 'FAIL'}; raw={raw}", flush=True)
         for line in text.splitlines():
-            if line.startswith(("CASE ", "REPORTCASE ", "FAIL ", "RESULT:")):
+            if line.startswith(
+                ("CASE ", "REPORTCASE ", "FAIRNESSCASE ", "FAIL ", "RESULT:")
+            ):
                 print(line, flush=True)
     (output / "results.json").write_text(json.dumps(trials, indent=2))
     raise SystemExit(any(row["status"] != "PASS" for row in trials))

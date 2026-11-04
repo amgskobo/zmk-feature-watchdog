@@ -14,6 +14,11 @@
     "python3 -m unittest discover -s tests -p test_retirement.py -v"
   ],
   "coverage_map": "tests/README.md",
+  "relay_request_admission": "tests/relay-stack: original7relay/3reporter groups plus queued2/running3/FIFO-full correlatedbusy/recovery and malformed-head/page/status tail; worker and producer2KiB, same344B downstream and128B sampled headroom, each ELF3times.",
+  "relay_fairness": "Canonical owner additionally dispatches tests/relay-stack/run.py --fairness: production freeze/capture/trace + actual task_wdt, replenished FIFO for4x100ms, ordered responses and queue-owned feed progress/no freeze, real stalled-queue ISR detection + resumed feed; identical separate ELF3times.",
+  "web_authorization_deadline": "tests/web/authorizationLifetime.spec.tsx: actual pinned SDK, controlled lower call_rpc; lock retires displayed data/page/deletion/relay lifetime, batched unlock and StrictMode, six-second success, exact15s timeout/late reply/retry.",
+  "review_negative_controls": "tests/review_negative_control.py ISOLATED_OWNER FAULT: relay-drain => fairness3 assertion failures; fifo-overwrite => stack3 identity failures; web-lock/sdk-timeout/delete-zero => complete owner Web entries, actual scenario assertions required; compile/setup/timeout failures do not qualify.",
+  "web_deletion_feedback": "tests/web/deletionFeedback.spec.tsx: six outcomes and retained-row retry, actual component/codec/provider, controlled backend; original success/error controls preserved.",
   "collector": "tests/support/qemu_capture.py plus tests/test_qemu_capture.py: every terminal-record prefix, delayed suffix, EOF and timeout; raw ordered logs and unchanged kernel assertions.",
   "unsecured_fixture": "tests/studio_unsecured reuses the complete canonical Studio C assertions; default secured and explicit unsecured registry/notification expectations both execute.",
   "mutation_fixture": "tests/store/mutate_overwrite.py preserves all ten overwrite controls with exactly-once selectors, capacities16/1, raw evidence and compile-failure rejection.",

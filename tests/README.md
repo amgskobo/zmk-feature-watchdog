@@ -316,6 +316,8 @@ group holds the first response in transport while another thread submits a
 second request to the same work item: ordered IDs 7/8, status and checkpoint
 bytes must remain independent. Seven relay and three reporter groups run from
 the same ELF three times; ordered logs and source/dependency identities persist.
+The fixture uses a 16 KiB deferred log buffer to retain the complete relay and
+request-admission burst for the unchanged ordered-log assertions.
 At least 128 sampled unused bytes reserve Cortex-M FP exception frames/context.
 
 The former FIFO-only event substitute omitted real event/send stack cost.
@@ -434,6 +436,14 @@ and raw fault evidence export. The incident view additionally rejects a retired
 measurement UI entry or background health request. Controlled transports do not
 establish actual USB/BLE or physical input acceptance.
 
+The cache helper below is a separate compatibility lane for the historical
+Custom Settings revision `c6a7fef3a3be3d3ace5de9a4b0628c6418cd1f3f`.
+The ordinary production and isolated owner manifests select the current reviewed
+fork revision; results from this older archive do not establish that selection.
+Before using `PIN.tar`, require SHA-256
+`3e815475a9756ef1b69d5352bc5d0284fec2b4cf20e1c402a474978010e83ff1`.
+Keep the archive identity distinct from the current dependency pin.
+
 For a prepopulated read-only cache outside an isolated west workspace,
 `tests/prepare-workspace.py --cache CACHE --commands COMMANDS --settings-tar PIN.tar
 --owner OWNER --output NEW_WORKSPACE` prepares exact temporary compiler inputs.
@@ -497,3 +507,76 @@ native scenario, wrong-role and unrelated-fixture controls.
 It runs all configured Jest scenarios in one worker process. The pre-commit
 Jest hook dispatches this same owner entry so nested workers do not multiply
 the global container budget. Build and lint retain their separate package entries.
+
+The relay-stack fixture retains all seven relay/three reporter groups and adds
+queued-two and running-three requests with exact IDs/status/checkpoint bytes.
+A four-slot full queue must return a correlated busy error to the fifth request,
+drain the accepted four in order and accept a later retry. The overflow producer
+also runs on a 2 KiB Cortex-M stack with the same 344-byte downstream reservation
+and 128-byte sampled exception headroom. All cases repeat the identical ELF three
+times. Web deletion regressions retain success/explicit backend-error controls,
+require feedback for zero/wrong-kind/count/empty results, preserve the retained
+row and perform a successful retry. A malformed-head request followed by a
+page and status must still run both valid tail entries in order. Test completion
+uses a real queue drain: a single `k_work_flush` observes an invocation and
+cannot stand in for the full chain of future self-submissions.
+
+The canonical owner also dispatches the separate fairness variant:
+
+```bash
+python3 tests/relay-stack/run.py --fairness --zephyr RESOLVED_ZEPHYR \
+  --cmsis RESOLVED_CMSIS --nanopb RESOLVED_NANOPB --zmk RESOLVED_DYA \
+  --artifacts FRESH_OUTPUT
+```
+
+It reuses the same production relay/executor/event boundary and adds the complete
+production freeze monitor, trace/capture units and real Zephyr `task_wdt`. A
+higher-priority consumer replenishes the four-slot FIFO before each bounded
+one-millisecond transport return for four 100ms watchdog periods. IDs remain
+ordered, responses continue, the monitored queue itself feeds at least four times
+and no freeze is recorded. A real queue blocker then must trigger the timer ISR's
+minimal/full freeze publication for that low-priority channel; release must
+restore feeding. Kernel watchdog add/feed wrappers observe the real calls and
+assert their queue context; they do not replace timer/feed behavior. Pending
+publication/reboot and store/transport remain controlled observers. The same
+fairness ELF runs three times and retains its identities/logs separately from
+the unchanged original stack/reporter variant. Neither establishes actual radio,
+Flash, reboot or worst-case stack acceptance. The single-request core transport
+wait described in the design is still a separate unresolved boundary.
+
+`tests/web/authorizationLifetime.spec.tsx` keeps the pinned SDK implementation
+real above a controlled `call_rpc`: late page after lock, batched lock/unlock
+during deletion, old relay answer versus a fresh request, StrictMode setup,
+six-second success, actual fifteen-second timeout, ignored late result and retry.
+The complete existing Web/codec/privacy/deletion scenarios remain required.
+
+The Web lifetime exposes frozen methods over private authorization/controller
+state, so effects and notification callbacks do not mutate memoized values.
+StrictMode setup replay and synchronous lock retirement retain the same owner
+regressions and the real pinned-SDK fifteen-second deadline checks.
+The connected session starts in its loading state before the deferred initial
+RPC begins, including after unlock; switching source also marks the scheduled
+collection as loading. The existing loading/empty-report test keeps its
+immediate loading assertion and its completed empty-state assertion.
+
+Run each reviewed negative control only in a fresh isolated owner source copy:
+
+```bash
+python3 tests/review_negative_control.py ISOLATED_OWNER FAULT
+```
+
+`relay-drain` restores unbounded FIFO draining; the full fairness variant must
+fail its feed/no-freeze assertions in all three runs while still completing
+responses and detecting the genuine-stall control. `fifo-overwrite` discards
+admitted bytes; the original relay-stack variant must reject its queued IDs and
+full-FIFO assertions in all three runs. `web-lock` disables only core lock
+handling and must fail the authorization lifetime cases. `sdk-timeout` restores
+the pinned SDK's five-second budget and must fail the six-second success and
+fifteen-second boundary assertions. `delete-zero` restores silent zero-count
+deletion and must fail the retained-row feedback case. Run the Web faults through
+`bash tests/run-web.sh`, with the existing locked dependencies. Source selectors
+must match exactly once. Compile/setup failures, collection errors, timeouts and
+unclassified failures are not accepted as killed controls; preserve ordered raw
+output and actual assertion failures. Existing arithmetic/store/context/info-log
+and native admission controls remain required. These remain controlled checks,
+with no new physical acceptance claim.

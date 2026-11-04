@@ -18,7 +18,7 @@ manifest:
       import: true
     - name: zmk-feature-custom-settings
       url: https://github.com/amgskobo/zmk-feature-custom-settings
-      revision: b91a8ceb0a57a0cf41b34270752d79463e2848fa
+      revision: c4071b095c3007d1deb055c609603ca9b5897d14
     - name: zephyr
       remote: zmkfirmware
       revision: 10ba6d0cb38bc3d258775d27982f707599320085

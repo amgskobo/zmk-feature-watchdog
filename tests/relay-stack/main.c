@@ -67,6 +67,11 @@ void fixture_transport(const void *event, size_t size) {
     if (size != sizeof(struct zmk_watchdog_relay_response) || k_msgq_put(&sent, event, K_NO_WAIT)) {
         atomic_inc(&overflow);
     }
+#if defined(CONFIG_WATCHDOG_RELAY_FAIRNESS_TEST)
+    /* A bounded send delay lets the real software watchdog timer advance.
+     * A higher-priority consumer replenishes the FIFO before this returns. */
+    k_sleep(K_MSEC(1));
+#endif
 }
 /* Actual DYA event macros/dispatch run above this transport boundary. Reserve
  * 344 bytes for synchronous downstream stack use: the installed right ELF's
@@ -124,6 +129,13 @@ int zmk_watchdog_store_delete(uint16_t id) {
 }
 int zmk_watchdog_store_delete_all(void) { return -ENOTSUP; }
 
+static void flush_requests(void) {
+    /* A work-item flush waits for the invocation it observes, not every
+     * future self-submission. Drain the queue so all admitted FIFO entries
+     * reach the unchanged response/order assertions below. */
+    CHECK(k_work_queue_drain(&relay_queue, false) >= 0);
+}
+
 static void request(unsigned sequence, unsigned kind, unsigned start, unsigned expected) {
     cormoran_watchdog_RelayRequest query = cormoran_watchdog_RelayRequest_init_zero;
     query.request_id = sequence;
@@ -135,8 +147,7 @@ static void request(unsigned sequence, unsigned kind, unsigned start, unsigned e
     CHECK(pb_encode(&out, cormoran_watchdog_RelayRequest_fields, &query));
     event.size = out.bytes_written;
     raise_zmk_watchdog_relay_request(event);
-    struct k_work_sync sync;
-    k_work_flush(&watchdog_relay_process_work, &sync);
+    flush_requests();
     CHECK(atomic_get(&overflow) == 0);
     CHECK(last_breadcrumb == ZMK_WDG_RELAY_WORK_END);
     unsigned cores = 0, extensions = 0, done = 0, responses = 0;
@@ -214,8 +225,7 @@ static void health_request(void) {
     memcpy(event.payload, legacy, sizeof(legacy));
     event.size = sizeof(legacy);
     raise_zmk_watchdog_relay_request(event);
-    struct k_work_sync sync;
-    k_work_flush(&watchdog_relay_process_work, &sync);
+    flush_requests();
     struct zmk_watchdog_relay_response wire;
     CHECK(k_msgq_get(&sent, &wire, K_NO_WAIT) == 0 && wire.size <= 128);
     cormoran_watchdog_RelayResponse answer = cormoran_watchdog_RelayResponse_init_zero;
@@ -255,8 +265,7 @@ static void concurrent_requests(void) {
      * their IDs/status/checkpoint bytes independent. */
     enqueue_status(8);
     k_sem_give(&transport_release);
-    struct k_work_sync sync;
-    k_work_flush(&watchdog_relay_process_work, &sync);
+    flush_requests();
     for (unsigned sequence = 7; sequence <= 8; ++sequence) {
         struct zmk_watchdog_relay_response wire;
         CHECK(k_msgq_get(&sent, &wire, K_NO_WAIT) == 0);
@@ -278,6 +287,152 @@ static void concurrent_requests(void) {
     size_t unused;
     CHECK(k_thread_stack_space_get(&relay_queue.thread, &unused) == 0 && unused >= 128);
     printk("CASE seq=7 concurrent=2 ordered_ids=7,8 unused=%u\n", (unsigned)unused);
+}
+
+K_SEM_DEFINE(request_blocked, 0, 1);
+K_SEM_DEFINE(request_release, 0, 1);
+static void block_requests(struct k_work *work) {
+    ARG_UNUSED(work);
+    k_sem_give(&request_blocked);
+    CHECK(k_sem_take(&request_release, K_SECONDS(1)) == 0);
+}
+K_WORK_DEFINE(request_blocker, block_requests);
+
+static void expect_status(unsigned sequence) {
+    struct zmk_watchdog_relay_response wire = {0};
+    CHECK(k_msgq_get(&sent, &wire, K_NO_WAIT) == 0);
+    cormoran_watchdog_RelayResponse response = cormoran_watchdog_RelayResponse_init_zero;
+    pb_istream_t input = pb_istream_from_buffer(wire.payload, wire.size);
+    CHECK(pb_decode(&input, cormoran_watchdog_RelayResponse_fields, &response));
+    CHECK(response.request_id == sequence);
+    CHECK(response.which_relay_response_type == cormoran_watchdog_RelayResponse_response_tag);
+    const cormoran_watchdog_RelayNonListResponse *result = &response.relay_response_type.response;
+    CHECK(result->which_relay_non_list_response_type ==
+          cormoran_watchdog_RelayNonListResponse_status_tag);
+    CHECK(result->relay_non_list_response_type.status.stored == stored);
+    CHECK(result->relay_non_list_response_type.status.previous_diagnostics.size == 80);
+    CHECK(memcmp(result->relay_non_list_response_type.status.previous_diagnostics.bytes, checkpoint,
+                 80) == 0);
+}
+
+static void queued_requests(void) {
+    k_work_submit_to_queue(&relay_queue, &request_blocker);
+    CHECK(k_sem_take(&request_blocked, K_SECONDS(1)) == 0);
+    enqueue_status(110);
+    enqueue_status(111);
+    k_sem_give(&request_release);
+    flush_requests();
+    expect_status(110);
+    expect_status(111);
+    CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
+    printk("REQUESTCASE queued-two ordered_ids=110,111\n");
+}
+
+static void queued_failure_and_page(void) {
+    k_work_submit_to_queue(&relay_queue, &request_blocker);
+    CHECK(k_sem_take(&request_blocked, K_SECONDS(1)) == 0);
+    struct zmk_watchdog_relay_request malformed = {.size = 1, .payload = {0xff}};
+    raise_zmk_watchdog_relay_request(malformed);
+    cormoran_watchdog_RelayRequest query = cormoran_watchdog_RelayRequest_init_zero;
+    query.request_id = 501;
+    query.has_request = true;
+    query.request.which_request_type = cormoran_watchdog_Request_list_incidents_tag;
+    struct zmk_watchdog_relay_request page = {0};
+    pb_ostream_t output = pb_ostream_from_buffer(page.payload, sizeof(page.payload));
+    CHECK(pb_encode(&output, cormoran_watchdog_RelayRequest_fields, &query));
+    page.size = output.bytes_written;
+    raise_zmk_watchdog_relay_request(page);
+    enqueue_status(502);
+    k_sem_give(&request_release);
+    flush_requests();
+    unsigned packets = 0, cores = 0, diagnostics = 0, done = 0;
+    while (k_msgq_num_used_get(&sent) > 1) {
+        struct zmk_watchdog_relay_response wire;
+        CHECK(k_msgq_get(&sent, &wire, K_NO_WAIT) == 0);
+        cormoran_watchdog_RelayResponse response = cormoran_watchdog_RelayResponse_init_zero;
+        pb_istream_t input = pb_istream_from_buffer(wire.payload, wire.size);
+        CHECK(pb_decode(&input, cormoran_watchdog_RelayResponse_fields, &response));
+        CHECK(response.request_id == 501);
+        ++packets;
+        if (response.which_relay_response_type ==
+            cormoran_watchdog_RelayResponse_incident_chunk_tag) {
+            if (response.relay_response_type.incident_chunk.done)
+                ++done;
+            else
+                ++cores;
+        } else if (response.which_relay_response_type ==
+                   cormoran_watchdog_RelayResponse_diagnostic_chunk_tag) {
+            ++diagnostics;
+        } else
+            CHECK(false);
+    }
+    CHECK(packets == 9 && cores == 4 && diagnostics == 4 && done == 1);
+    expect_status(502);
+    CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
+    printk("REQUESTCASE malformed-page-tail page=501 packets=9 status=502\n");
+}
+
+static void running_three_requests(void) {
+    atomic_set(&hold_transport, 1);
+    enqueue_status(201);
+    CHECK(k_sem_take(&transport_entered, K_SECONDS(1)) == 0);
+    enqueue_status(202);
+    enqueue_status(203);
+    k_sem_give(&transport_release);
+    flush_requests();
+    expect_status(201);
+    expect_status(202);
+    expect_status(203);
+    CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
+    size_t unused;
+    CHECK(k_thread_stack_space_get(&relay_queue.thread, &unused) == 0 && unused >= 128);
+    printk("REQUESTCASE running-three ordered_ids=201,202,203 unused=%u\n", (unsigned)unused);
+}
+
+K_THREAD_STACK_DEFINE(request_producer_stack, 2048);
+static struct k_thread request_producer;
+static size_t producer_unused;
+static void overflow_request(void *a, void *b, void *c) {
+    ARG_UNUSED(a);
+    ARG_UNUSED(b);
+    ARG_UNUSED(c);
+    enqueue_status(404);
+    CHECK(k_thread_stack_space_get(k_current_get(), &producer_unused) == 0);
+    CHECK(producer_unused >= MIN_EXCEPTION_HEADROOM);
+}
+
+static void full_request_queue(void) {
+    k_work_submit_to_queue(&relay_queue, &request_blocker);
+    CHECK(k_sem_take(&request_blocked, K_SECONDS(1)) == 0);
+    /* Independent public bound: four pending requests, plus the worker's own
+     * immutable current input. A fifth pending request gets a correlated error. */
+    for (unsigned id = 400; id < 404; ++id)
+        enqueue_status(id);
+    k_thread_create(&request_producer, request_producer_stack,
+                    K_THREAD_STACK_SIZEOF(request_producer_stack), overflow_request, NULL, NULL,
+                    NULL, 5, 0, K_NO_WAIT);
+    CHECK(k_thread_join(&request_producer, K_SECONDS(1)) == 0);
+    struct zmk_watchdog_relay_response wire = {0};
+    CHECK(k_msgq_get(&sent, &wire, K_NO_WAIT) == 0);
+    cormoran_watchdog_RelayResponse response = cormoran_watchdog_RelayResponse_init_zero;
+    pb_istream_t input = pb_istream_from_buffer(wire.payload, wire.size);
+    CHECK(pb_decode(&input, cormoran_watchdog_RelayResponse_fields, &response));
+    CHECK(response.request_id == 404);
+    CHECK(response.which_relay_response_type == cormoran_watchdog_RelayResponse_response_tag);
+    CHECK(response.relay_response_type.response.which_relay_non_list_response_type ==
+          cormoran_watchdog_RelayNonListResponse_error_tag);
+    CHECK(strstr(response.relay_response_type.response.relay_non_list_response_type.error.message,
+                 "busy") != NULL);
+    k_sem_give(&request_release);
+    flush_requests();
+    for (unsigned id = 400; id < 404; ++id)
+        expect_status(id);
+    enqueue_status(405);
+    flush_requests();
+    expect_status(405);
+    CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
+    printk("REQUESTCASE full correlated_busy=404 recovered=405 producer_unused=%u\n",
+           (unsigned)producer_unused);
 }
 
 static void common_context_page(void) {
@@ -304,8 +459,7 @@ static void common_context_page(void) {
     CHECK(pb_encode(&output, cormoran_watchdog_RelayRequest_fields, &query));
     event.size = output.bytes_written;
     raise_zmk_watchdog_relay_request(event);
-    struct k_work_sync sync;
-    k_work_flush(&watchdog_relay_process_work, &sync);
+    flush_requests();
     CHECK(!atomic_get(&overflow));
     static struct watchdog_relay_page page;
     static cormoran_watchdog_Response assembled;
@@ -355,7 +509,10 @@ static void common_context_page(void) {
            (unsigned)unused);
 }
 
+int report_initial_deadline(void);
+
 int main(void) {
+    failures += report_initial_deadline();
     checkpoint[0] = 1;
     checkpoint[1] = 7;
     checkpoint[2] = 4;
@@ -388,6 +545,10 @@ int main(void) {
     request(5, cormoran_watchdog_Request_list_incidents_tag, 4, 2);
     request(6, cormoran_watchdog_Request_list_incidents_tag, 6, 0);
     concurrent_requests();
+    queued_requests();
+    queued_failure_and_page();
+    running_three_requests();
+    full_request_queue();
     health_request();
     CHECK(breadcrumbs > 30);
     failures += report_cases();

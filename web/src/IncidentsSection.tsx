@@ -10,6 +10,7 @@ import {
   ZMKCustomSubsystem,
   ZMKAppContext,
 } from "@cormoran/zmk-studio-react-hook";
+import { LockState } from "@zmkfirmware/zmk-studio-ts-client/core";
 import {
   Request,
   Response,
@@ -84,8 +85,108 @@ const PAGE_SIZE = 4;
 const RELAY_TIMEOUT_MS = 3000;
 const RPC_TIMEOUT_MS = 15000;
 
+function createIncidentLifetime(identity: string, initiallyActive: boolean) {
+  // Keep cancellation state private; React memoizes only this frozen API.
+  let active = initiallyActive;
+  const pending = new Set<AbortController>();
+  return Object.freeze({
+    identity,
+    isActive: () => active,
+    activate(enabled: boolean) {
+      active = enabled;
+    },
+    retire() {
+      active = false;
+      for (const controller of [...pending]) controller.abort();
+      pending.clear();
+    },
+    track(controller: AbortController) {
+      if (active) pending.add(controller);
+      else controller.abort();
+    },
+    untrack(controller: AbortController) {
+      pending.delete(controller);
+    },
+  });
+}
+type IncidentLifetime = ReturnType<typeof createIncidentLifetime>;
+const connectionIds = new WeakMap<object, number>();
+let nextConnectionId = 1;
+function connectionIdentity(connection: object | null | undefined) {
+  if (!connection) return 0;
+  const identity = connectionIds.get(connection) ?? nextConnectionId++;
+  connectionIds.set(connection, identity);
+  return identity;
+}
 export function IncidentsSection() {
+  const app = useContext(ZMKAppContext);
+  const connection = app?.state.connection;
+  const index = app?.findSubsystem(SUBSYSTEM_IDENTIFIER)?.index;
+  const catalog = JSON.stringify(app?.state.customSubsystems?.subsystems ?? []);
+  const [authorization, setAuthorization] = useState({
+    connection,
+    generation: 0,
+    locked: false,
+  });
+  const locked =
+    authorization.connection === connection && authorization.locked;
+  const lifetime = useMemo<IncidentLifetime>(
+    () =>
+      createIncidentLifetime(
+        `${connectionIdentity(connection)}:${index}:${catalog}:${authorization.generation}`,
+        !locked
+      ),
+    [connection, index, catalog, authorization.generation, locked]
+  );
+  useEffect(() => {
+    lifetime.activate(!locked);
+    return () => lifetime.retire();
+  }, [lifetime, locked]);
+  useEffect(() => {
+    if (!app || !connection) return;
+    let subscribed = true;
+    const unsubscribe = app.onNotification({
+      type: "core",
+      callback: (notification) => {
+        if (
+          !subscribed ||
+          (notification.lockStateChanged !==
+            LockState.ZMK_STUDIO_CORE_LOCK_STATE_LOCKED &&
+            notification.lockStateChanged !==
+              LockState.ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED)
+        )
+          return;
+        // Retire before React resets the view. Even a batched lock/unlock
+        // cannot authorize a continuation that captured the old lifetime.
+        lifetime.retire();
+        setAuthorization((previous) => ({
+          connection,
+          generation: previous.generation + 1,
+          locked:
+            notification.lockStateChanged ===
+            LockState.ZMK_STUDIO_CORE_LOCK_STATE_LOCKED,
+        }));
+      },
+    });
+    return () => {
+      subscribed = false;
+      unsubscribe();
+    };
+  }, [app, connection, lifetime]);
+  if (locked) {
+    return (
+      <section className="card">
+        <h2>Fault and reset diagnostics</h2>
+        <p>Studio is locked. Unlock the keyboard to read incident history.</p>
+      </section>
+    );
+  }
+  return <IncidentsSession key={lifetime.identity} lifetime={lifetime} />;
+}
+
+function IncidentsSession({ lifetime }: { lifetime: IncidentLifetime }) {
   const zmkApp = useContext(ZMKAppContext);
+  const subsystem = zmkApp?.findSubsystem(SUBSYSTEM_IDENTIFIER) ?? null;
   // 0 = central/local; >0 = split peripheral
   // slot N, relayed over CONFIG_ZMK_SPLIT_RELAY_EVENT (DESIGN.md, Studio RPC, split relay and client). There
   // is no discovery of how many peripherals are connected, so this offers a
@@ -93,7 +194,11 @@ export function IncidentsSection() {
   const [source, setSource] = useState(0);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  // A connected session already has an initial collection scheduled, even
+  // while its RPC waits for the lifetime's effect setup/StrictMode replay.
+  const [isLoading, setIsLoading] = useState(
+    () => Boolean(subsystem && zmkApp?.state.connection) && lifetime.isActive()
+  );
   const [error, setError] = useState<string | null>(null);
   const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
   const [reportCopied, setReportCopied] = useState(false);
@@ -108,21 +213,24 @@ export function IncidentsSection() {
     expected: null as number | null,
   });
 
-  const subsystem = zmkApp?.findSubsystem(SUBSYSTEM_IDENTIFIER) ?? null;
-
   const callRpc = useCallback(
     async (request: Request): Promise<Response | null> => {
-      if (!zmkApp?.state.connection || !subsystem) return null;
+      if (!lifetime.isActive() || !zmkApp?.state.connection || !subsystem)
+        return null;
       const service = new ZMKCustomSubsystem(
         zmkApp.state.connection,
         subsystem.index
       );
       const payload = Request.encode(request).finish();
-      const responsePayload = await service.callRPC(payload);
+      // The pinned SDK otherwise applies its own five-second default before
+      // callWithRelay's acknowledgement deadline can expire.
+      const responsePayload = await service.callRPC(payload, {
+        timeout: RPC_TIMEOUT_MS,
+      });
       if (!responsePayload) return null;
       return Response.decode(responsePayload);
     },
-    [zmkApp, subsystem]
+    [zmkApp, subsystem, lifetime]
   );
 
   const callRpcWithRelay = useCallback(
@@ -130,7 +238,7 @@ export function IncidentsSection() {
       request: Request,
       signal?: AbortSignal
     ): Promise<Response | null> => {
-      if (!zmkApp || !subsystem) return null;
+      if (!lifetime.isActive() || !zmkApp || !subsystem) return null;
       const response = await callWithRelay(
         () => callRpc(request),
         (callback) =>
@@ -156,7 +264,7 @@ export function IncidentsSection() {
         );
       return response;
     },
-    [callRpc, zmkApp, subsystem, source]
+    [callRpc, zmkApp, subsystem, source, lifetime]
   );
 
   const callRpcAwaitingRelay = useMemo(
@@ -164,12 +272,16 @@ export function IncidentsSection() {
     [callRpcWithRelay]
   );
   const refreshAll = useCallback(async () => {
+    if (!lifetime.isActive()) return;
     requestAbort.current?.abort();
     const controller = new AbortController();
     requestAbort.current = controller;
+    lifetime.track(controller);
     const token = ++generation.current;
     const active = () =>
-      token === generation.current && !controller.signal.aborted;
+      lifetime.isActive() &&
+      token === generation.current &&
+      !controller.signal.aborted;
     const collected: Incident[] = [];
     let expected: number | null = null;
     setIsLoading(true);
@@ -239,9 +351,10 @@ export function IncidentsSection() {
         expected,
       });
     } finally {
+      lifetime.untrack(controller);
       if (active()) setIsLoading(false);
     }
-  }, [callRpcAwaitingRelay, source]);
+  }, [callRpcAwaitingRelay, source, lifetime]);
 
   const retireRequests = useCallback(() => {
     ++generation.current;
@@ -273,10 +386,15 @@ export function IncidentsSection() {
 
     setStatus(null);
     setIncidents([]);
+    setIsLoading(true);
     setConfirmingDeleteAll(false);
     setActionError(null);
-    void refreshAll();
-    return retireRequests;
+    // Run after the lifetime's setup, including StrictMode's effect replay.
+    const startup = window.setTimeout(() => void refreshAll(), 0);
+    return () => {
+      window.clearTimeout(startup);
+      retireRequests();
+    };
     // Re-run when the connected watchdog subsystem becomes available, or
     // when the user switches source (central/peripheral).
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -314,24 +432,41 @@ export function IncidentsSection() {
   }, [zmkApp, subsystem?.index, source]);
 
   const performDelete = async (request: Request) => {
+    if (!lifetime.isActive()) return;
     requestAbort.current?.abort();
     const controller = new AbortController();
     requestAbort.current = controller;
+    lifetime.track(controller);
     const token = generation.current;
     const active = () =>
-      token === generation.current && !controller.signal.aborted;
+      lifetime.isActive() &&
+      token === generation.current &&
+      !controller.signal.aborted;
     setIsLoading(true);
     setActionError(null);
     try {
       const response = await callRpcAwaitingRelay(request, controller.signal);
       if (!active()) return;
-      if (response?.error) setActionError(response.error.message);
+      if (response?.error) {
+        setActionError(response.error.message);
+      } else if (!response?.deleteResult) {
+        setActionError("Unexpected deletion response. Refresh and retry.");
+      } else if (!request.deleteIncidents?.all) {
+        const expected = request.deleteIncidents?.ids.length ?? 0;
+        const deleted = response.deleteResult.deleted;
+        if (deleted === 0) {
+          setActionError("No incident was deleted. Refresh and retry.");
+        } else if (deleted !== expected) {
+          setActionError("Unexpected deletion count. Refresh and retry.");
+        }
+      }
       setConfirmingDeleteAll(false);
       await refreshAll();
     } catch (err) {
       if (active())
         setActionError(err instanceof Error ? err.message : "Deletion failed");
     } finally {
+      lifetime.untrack(controller);
       if (active()) setIsLoading(false);
     }
   };
@@ -345,6 +480,7 @@ export function IncidentsSection() {
     );
 
   const copyReport = async () => {
+    if (!lifetime.isActive()) return;
     const token = generation.current;
     setReportCopied(false);
     setCopyError(null);
@@ -383,9 +519,10 @@ export function IncidentsSection() {
         })),
       };
       await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
-      if (token === generation.current) setReportCopied(true);
+      if (lifetime.isActive() && token === generation.current)
+        setReportCopied(true);
     } catch (err) {
-      if (token !== generation.current) return;
+      if (!lifetime.isActive() || token !== generation.current) return;
       setCopyError(
         err instanceof Error ? err.message : "Could not copy diagnostic report"
       );
