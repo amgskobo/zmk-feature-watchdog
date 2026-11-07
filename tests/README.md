@@ -500,8 +500,27 @@ reject missing configuration when both the request and build omit it; excluded
 roles cannot replace the requested role. The verifier retains all three raw
 runs before comparing unchanged ordered snapshots and rejects logged failures,
 fatal output and missing/nonzero completions. `tests/test_native_verifier.py`
-owns eleven real-ELF admission controls, including a deliberately missing
-native scenario, wrong-role and unrelated-fixture controls.
+owns fourteen real-ELF admission controls, including a deliberately missing
+native scenario, wrong-role and unrelated-fixture controls. Recoverable ASan
+and UBSan programs independently prove a real diagnostic with exit 0 before
+requiring rejection; the original verifier incorrectly admitted both programs
+through all three repeats with matching checked initialization and snapshots.
+Ordinary sanitizer configuration names and synthetic application markers remain
+accepted. Retained raw diagnostics take precedence over successful process,
+initialization and snapshot results.
+
+At the pinned DYA test core `e5c9b6915b56801193e359dd9bad4a167ce0d1b8`,
+combined ASan/UBSan native mock runs still diagnose signed `1 << 31` in
+`app/module/drivers/kscan/kscan_mock.c:103`. The sanitizer-clean gate is BLOCKED
+by that selected dependency. All five fixtures were replayed three times per
+binary: strict combined runs exit 1, while recovering runs exit 0 and retain
+matching snapshots despite the diagnostics. The owner verifier rejects both.
+A strict configuration also requires `CONFIG_ASAN_RECOVER=n`: the selected
+Zephyr POSIX backend otherwise appends `-fsanitize-recover=all` after
+`EXTRA_CFLAGS`, overriding an earlier `-fno-sanitize-recover=all`. Check the final
+compiler arguments and real process output when selecting a profile. Keep the
+unchanged core, fixtures and feature gates; ASan-only, optimized and ARM results
+retain their own scope. Remeasure this boundary after a core-pin change.
 
 `bash tests/run-web.sh` is the canonical schema-generation/Web test entry.
 It runs all configured Jest scenarios in one worker process. The pre-commit

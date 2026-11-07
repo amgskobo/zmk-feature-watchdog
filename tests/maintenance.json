@@ -30,10 +30,11 @@
   },
   "gaps": [
     "Physical USB/BLE/split delivery, timing, power and retention require matching production-board evidence.",
+    "At pinned DYA e5c9b6915b56801193e359dd9bad4a167ce0d1b8, all five native mock fixtures diagnose kscan_mock.c:103 signed 1 << 31 in combined ASan/UBSan. The clean gate is BLOCKED: strict CONFIG_ASAN_RECOVER=n runs exit1; recovering runs exit0 with matching snapshots, and both are rejected by the owner verifier. The selected Zephyr adds a later -fsanitize-recover=all when ASAN_RECOVER=y, so final compiler flags must be verified. Each profile retains identical binaries and three independent runs; ASan-only/optimized/ARM results are separate.",
     "The relay-stack fixture exercises actual DYA event dispatch with a declared 344-byte downstream stack budget and serialized worker response storage. This model does not establish actual BT/radio delivery or kernel worst-case stack use. Physical retrieval histories remain private; congestion, power and long-run acceptance require matching production-board evidence.",
     "Performance/health measurement retired; source and unique assertions archived per tests/retired-measurements.md. No new physical verdict."
   ],
-  "native_verification": "tests/native_verifier.py: actual exit, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times.",
+  "native_verification": "tests/native_verifier.py: actual exit, recoverable ASan/UBSan diagnostic rejection, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times. Fourteen real-ELF controls preserve the original eleven; two recovering faults prove exit 0 independently before requiring rejection, and benign sanitizer option/status names remain accepted.",
   "identity_dependencies": "tests/decoder/test_build_identity.py: selected peripheral context header belongs to the digest and CMake configure dependencies; a header-only edit regenerates identity; central/disabled selections stay independent.",
   "timeout_width": {
     "entry": "python3 -m unittest discover -s tests -p test_timeout_width.py -v",

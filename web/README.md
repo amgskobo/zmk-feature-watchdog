@@ -86,10 +86,12 @@ requests receive the ordinary unsupported-request error before split dispatch.
 
 ## Console privacy
 
-The local Vite plugin redacts the two locked Studio SDKs' exception console
-arguments to fixed categories. New SDK console sites stop the build for review.
-Transport/error propagation remains intact. Run `npm test -- --runInBand` and
-`npm run build` with the existing locked dependencies; no install is implicit.
+The runtime console wrapper is installed before the application and redacts the
+two locked Studio SDKs' console arguments to fixed categories. The owner SDK
+console tests inspect the actual installed source and reject new sites or
+nonliteral leading labels for review. Transport/error propagation remains intact.
+Run `npm test -- --runInBand` and `npm run build` with the existing locked
+dependencies; no install is implicit.
 See [the owner tests](../tests/README.md) and [retirement map](../tests/retired-measurements.md).
 
 ## Dependency security

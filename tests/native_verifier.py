@@ -134,6 +134,18 @@ def verify_native(output: Path, tests: Path):
                 raise AssertionError(
                     f"{case}: native exit {result.returncode}; see {run}"
                 )
+            # Recoverable faults may preserve exit 0, checked initialization and
+            # the expected snapshot. Match actual diagnostic formats rather than
+            # ordinary sanitizer option names or application status markers.
+            if re.search(
+                r"^(?:(?:==\d+==)?(?:ERROR|WARNING|SUMMARY): "
+                r"(?:Address|Leak|Memory|Thread|UndefinedBehavior)Sanitizer:"
+                r"|(?:Address|UndefinedBehavior)Sanitizer:DEADLYSIGNAL"
+                r"|[^\n]+:\d+(?::\d+)?: runtime error:)",
+                raw,
+                re.M,
+            ):
+                raise AssertionError(f"{case}: sanitizer diagnostic; see {run}")
             if re.search(r"\bFAIL:", raw):
                 raise AssertionError(f"{case}: failed owner assertion; see {run}")
             for hook in hooks:

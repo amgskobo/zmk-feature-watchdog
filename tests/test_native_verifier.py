@@ -1,10 +1,12 @@
 """Use real synthetic ELF programs to check native-result admission."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from native_verifier import verify_native
 
@@ -33,10 +35,20 @@ class NativeVerifierContract(unittest.TestCase):
         self.binary = binary_dir / "zmk.exe"
 
     def compile(
-        self, *, hook=True, reported=0, process_exit=0, fatal=False, failed_log=False
+        self,
+        *,
+        hook=True,
+        reported=0,
+        process_exit=0,
+        fatal=False,
+        failed_log=False,
+        sanitizer=None,
+        extra_output=None,
     ):
         source = self.root / "program.c"
         body = "#include <stdio.h>\n"
+        if sanitizer == "address":
+            body += "static volatile unsigned char guarded[1];\n"
         if hook:
             body += (
                 "int owner_checked_control(void) { "
@@ -49,6 +61,15 @@ class NativeVerifierContract(unittest.TestCase):
             body += 'puts("ASSERTION FAIL"); '
         if failed_log:
             body += 'puts("<err> owner: FAIL: controlled assertion"); '
+        if extra_output is not None:
+            body += "puts(" + json.dumps(extra_output) + "); "
+        if sanitizer == "undefined":
+            body += "volatile int shift = 31; volatile int value = 1; "
+            body += "value = value << shift; (void)value; "
+        elif sanitizer == "address":
+            body += (
+                "volatile unsigned index = 1; guarded[index] = 7; (void)guarded[0]; "
+            )
         body += f'puts("EVENT 1"); return {process_exit}; }}\n'
         source.write_text(body)
         subprocess.run(
@@ -58,6 +79,16 @@ class NativeVerifierContract(unittest.TestCase):
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                *(
+                    [
+                        "-fsanitize=" + sanitizer,
+                        "-fsanitize-recover=" + sanitizer,
+                        "-fno-pie",
+                        "-no-pie",
+                    ]
+                    if sanitizer
+                    else []
+                ),
                 str(source),
                 "-o",
                 str(self.binary),
@@ -173,6 +204,43 @@ class NativeVerifierContract(unittest.TestCase):
         self.compile(fatal=True)
         with self.assertRaisesRegex(AssertionError, "fatal assertion"):
             verify_native(self.output, self.tests)
+
+    def test_recovering_ubsan_with_zero_exit_is_rejected(self):
+        self.compile(sanitizer="undefined")
+        self.check_recovering_sanitizer("runtime error:")
+
+    def test_recovering_asan_with_zero_exit_is_rejected(self):
+        self.compile(sanitizer="address")
+        with patch.dict(os.environ, {"ASAN_OPTIONS": "halt_on_error=0:detect_leaks=0"}):
+            self.check_recovering_sanitizer("ERROR: AddressSanitizer:")
+
+    def test_sanitizer_names_and_normal_markers_are_not_diagnostics(self):
+        self.compile(
+            extra_output="CONFIG_ASAN=y\nCONFIG_UBSAN=y\nAddressSanitizer enabled\n"
+            "OWNER_TEST_RESULT UndefinedBehaviorSanitizer=0\n"
+            "runtime error: none (synthetic application marker)"
+        )
+        verify_native(self.output, self.tests)
+
+    def check_recovering_sanitizer(self, diagnostic):
+        # Establish the runtime fault and zero exit independently of admission;
+        # a compile/setup failure cannot qualify as a rejected control.
+        result = subprocess.run(
+            [str(self.binary)],
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        (self.root / "sanitizer-control.log").write_text(result.stdout)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(diagnostic, result.stdout)
+        with self.assertRaisesRegex(AssertionError, "sanitizer diagnostic"):
+            verify_native(self.output, self.tests)
+        run = self.binary.parent.parent / "verified-runs/1"
+        self.assertEqual(json.loads((run / "command.json").read_text())["exit"], 0)
+        self.assertIn(diagnostic, (run / "raw.log").read_text())
 
 
 if __name__ == "__main__":
