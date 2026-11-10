@@ -367,7 +367,7 @@ bash tests/run-web.sh
 ```
 
 For a bounded complete firmware run, set `ZMK_TEST_MODE=full`, `J=1` and
-`CMAKE_BUILD_PARALLEL_LEVEL=2` with a fresh `OWNER_TEST_OUTPUT`. The owner board
+`CMAKE_BUILD_PARALLEL_LEVEL=1` with a fresh `OWNER_TEST_OUTPUT`. The owner board
 dispatcher already uses `-P1`; `J` separately bounds the supported core's native
 fixture dispatch. CPU quota alone does not bound that dispatch.
 
@@ -403,17 +403,32 @@ owner matrix. No network updates are implicit in the owner test command.
 ## Reproducible isolated checks
 
 Use this owner's `west/west-test-isolated.yml` and its pinned test dependency
-manifest. Test ZMK is `e5c9b6915b56801193e359dd9bad4a167ce0d1b8`;
+manifest. Test ZMK is `9f75b536cff5a63d34cba43de9be8652b8bd1915`;
 Zephyr is `10ba6d0cb38bc3d258775d27982f707599320085`. Resolve the
 manifest and verify actual checkout identities before running. Do not inherit
 global CMake module overrides or moving production dependency references into
 these isolated fixtures. The CI SDK image is pinned by digest in
 `.github/workflows/zmk-module.yml`; production dependency manifests are separate.
 
+The selected DYA revision is a reviewed local commit, not yet pushed or
+remotely retrievable from the declared `https://github.com/cormoran/zmk`
+source. Remote-only preparation is BLOCKED until that source is available.
+Offline prepared workspaces must already contain the exact commit and the
+complete Git-backed import graph. Set the workspace's runtime-only
+`manifest-rev` project ref to that selection when preparing copied metadata;
+do not alter an authoring checkout or substitute an older revision.
+
 Use a new `OWNER_TEST_OUTPUT` directory for every complete owner run. Native
 repeats reuse one compiled binary with independent initial-flash state; keep
 the first failure and raw combined stdout/stderr order. DYA-only compatibility
 still means no stock-ZMK test requirement.
+
+Keep Git metadata for projects that supply imported manifests or west commands,
+including the pinned `zmk-west-commands` project. A retained directory of working
+files alone cannot resolve a Git-backed west import. Check the complete selected
+graph before execution; an import/setup failure is BLOCKED, not a passing owner
+run. A separately verified core workspace may support focused entries, but does
+not replace the complete owner workspace or its required matrix.
 
 The test/tool static CI job installs pre-commit 4.7.0 and uses the pinned
 Ruff/clang-format/formatting hooks. Its SKIP list avoids repeating the firmware
@@ -421,6 +436,13 @@ and Web jobs. Local full pre-commit execution may run those functional hooks;
 prepare Web dependencies with the normal package lifecycle first where present.
 A successful hook exit must also leave source inputs unchanged. Snapshot and
 event-pattern bytes are excluded from whitespace rewriting.
+
+For a proposed commit, pass every scoped modified and untracked file to the
+unchanged configured hooks. Perform any private-index preparation in an isolated
+check environment; leave the author's real index and Git identity unchanged.
+Use the complete selected west workspace for the module-test hook and retain
+its actual nonempty fixture completion. File-filtered hooks for unchanged Web
+paths are not applicable; setup errors or failed applicable hooks remain open.
 
 
 Physical retrieval records are private and are not distributed with this test
@@ -488,10 +510,15 @@ historical stored values are unchanged; no new restart policy is introduced.
 
 The owner command boundary limits `zmk-build` to one target at a time by
 default. `OWNER_TEST_BUILD_PARALLELISM` selects an explicit positive target
-count; account for compiler jobs and concurrent owners in the global budget.
-`tests/test_build_budget.py` checks default/explicit forwarding and rejects
-invalid budgets before launching west. The canonical owner entry includes
-these controls without dropping any native or board scenario.
+count and forwards the same budget to the common-context runner's existing
+`--jobs` argument. The parser validates it before any context subprocess
+starts. Account for other compiler jobs and concurrent owners in the global
+budget. `tests/test_build_budget.py` exercises actual board/context dispatch
+arguments with the default, explicit one/two and invalid budgets; invalid
+values launch no child process. The original context entry, which omitted
+`--jobs` and used the runner's two-job default, fails these context controls.
+The canonical owner entry includes them without dropping any kernel variant,
+assertion or board scenario.
 
 Native result admission requires every `native_sim.keymap` fixture to have a
 matching binary. `required_hooks.json` names the expected checked initialization
@@ -509,18 +536,23 @@ Ordinary sanitizer configuration names and synthetic application markers remain
 accepted. Retained raw diagnostics take precedence over successful process,
 initialization and snapshot results.
 
-At the pinned DYA test core `e5c9b6915b56801193e359dd9bad4a167ce0d1b8`,
-combined ASan/UBSan native mock runs still diagnose signed `1 << 31` in
-`app/module/drivers/kscan/kscan_mock.c:103`. The sanitizer-clean gate is BLOCKED
-by that selected dependency. All five fixtures were replayed three times per
-binary: strict combined runs exit 1, while recovering runs exit 0 and retain
-matching snapshots despite the diagnostics. The owner verifier rejects both.
+The selected DYA test core `9f75b536cff5a63d34cba43de9be8652b8bd1915`
+uses unsigned state-bit masks for all three mock-event encodings. All five
+native fixtures passed combined strict ASan/UBSan with three owner-verified
+repeats per binary. The exact original header from
+`e5c9b6915b56801193e359dd9bad4a167ce0d1b8` is a named control: all five
+fixtures reject its signed `1 << 31` diagnostic at
+`app/module/drivers/kscan/kscan_mock.c:103` in three repeats per binary.
+Historical recovering runs exit 0 with matching snapshots despite the
+diagnostic; the owner verifier rejects those as well as strict failures.
 A strict configuration also requires `CONFIG_ASAN_RECOVER=n`: the selected
 Zephyr POSIX backend otherwise appends `-fsanitize-recover=all` after
 `EXTRA_CFLAGS`, overriding an earlier `-fno-sanitize-recover=all`. Check the final
-compiler arguments and real process output when selecting a profile. Keep the
-unchanged core, fixtures and feature gates; ASan-only, optimized and ARM results
-retain their own scope. Remeasure this boundary after a core-pin change.
+compiler arguments and real process output when selecting a profile. The fixed
+strict profiles retain the complete fixtures and feature gates; ASan-only,
+optimized and ARM results retain their own scope. A further core-pin change
+requires revalidation. This resolves the mock-header gate locally; source
+availability, browser and physical gates remain separate.
 
 `bash tests/run-web.sh` is the canonical schema-generation/Web test entry.
 It runs all configured Jest scenarios in one worker process. The pre-commit
@@ -599,3 +631,37 @@ unclassified failures are not accepted as killed controls; preserve ordered raw
 output and actual assertion failures. Existing arithmetic/store/context/info-log
 and native admission controls remain required. These remain controlled checks,
 with no new physical acceptance claim.
+
+## Task WDT default ownership
+
+`python3 tests/task_wdt_defaults.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT`
+configures the unchanged real DYA/Zephyr XIAO graph. Nine cases check the
+10000-ms monitor default, explicit fallback y/n, external/disabled-owner and
+freeze-disabled defaults, explicit minimum override, the 10-ms boundary,
+9999 ms and the 600000-ms deadline with a 10000-ms cap. A test-only earlier
+100-ms Kconfig default must configure and fail the named minimum assertion;
+configure/compiler errors do not qualify. These checks establish Kconfig,
+including the preserved explicit n value, without claiming that n is runtime-safe.
+
+`python3 tests/task-wdt-idle/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT`
+compiles the actual owner freeze initializer/feed work, unchanged ZMK workqueue
+and actual Zephyr Task WDT/kernel under strict ASan/UBSan and 64-bit timeouts.
+One- and two-queue binaries each run three times. Link wrappers only observe
+real timer starts during actual initialization/feeds; all calls reach Zephyr.
+The 1.2 s idle window admits no 100-ms background expiries, then the real 5 s
+feeds must restart the 10 s deadline. The fixture's explicit selected values
+are separate from the real full-board Kconfig default proof above.
+The old-100ms control must fail the named idle assertion. The original
+fallback-off choice must exit on the specified `task_wdt.c:79` signed-overflow
+diagnostic. Both controls build and run three times; build failures, other
+assertions, missing completion and unrelated diagnostics do not qualify.
+
+The complete `test_owner.py` dispatches both entries and retains the original
+seven board/role artifacts plus explicit minimum, external Task WDT and
+freeze-disabled artifacts. Normal monitors require fallback y/minimum10000,
+with original trace/diagnostic/resource assertions. The preblocked-sysworkq
+arming fixture retains its real ISR/deadline assertions with a finite 100-ms
+minimum matching its 100-ms channel; the same ELF runs three times.
+No patched core supplies any of these assertions. The separate combined
+ZMK mock sanitizer profile still encounters the selected core's documented
+kscan shift; native/compile results do not establish physical acceptance.

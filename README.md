@@ -8,9 +8,20 @@ Select that repository URL and revision in the module's west project entry.
 Keep the module's documented imports enabled where required. The original
 upstream installation examples below describe the upstream repository.
 
-The dependency manifests select the available Custom Settings revision
-`c4071b095c3007d1deb055c609603ca9b5897d14` from its reviewed fork;
-production imports and isolated tests use the same registry implementation.
+The dependency manifests select the pinned Custom Settings revision
+`c4071b095c3007d1deb055c609603ca9b5897d14` from its reviewed fork.
+Those imports select that registry for ordinary owner tests and consumers.
+A keyboard's explicit local override is a different source selection: record
+its URL, full commit and working-source identity, and validate that combination
+separately rather than treating the manifest pin as its resolved input.
+
+The isolated test manifest selects DYA
+`9f75b536cff5a63d34cba43de9be8652b8bd1915` from the declared
+`https://github.com/cormoran/zmk` source. This exact revision is a reviewed
+local commit and is not yet pushed or remotely retrievable. A fresh setup
+using only that remote is BLOCKED until the source is available; a prepared
+local workspace must contain the exact commit and complete imported graph.
+Local commits and passing checks do not publish the source.
 
 Records workqueue freezes, fatal errors and selected reset causes. Each split
 half owns its store. Optional custom Studio RPC reads/deletes local records or
@@ -81,6 +92,42 @@ one-second to one-minute backoff. Pending data clears after successful append or
 the documented full-store drop. Reset between Flash append and RAM clear is not
 an exactly-once transaction. Power loss/bootloader writes can erase retained RAM.
 
+### Software-only Task WDT configuration
+
+This module owns the `TASK_WDT_MIN_TIMEOUT` default while
+`ZMK_WATCHDOG_FREEZE_DETECT=y`. It follows the software freeze deadline, capped
+at Zephyr's supported 10000 ms maximum. A 10000 ms monitor therefore uses a
+10000 ms minimum instead of Zephyr's generic 100 ms background interval;
+queue-owned feeds still run every 5000 ms. For deadlines from 10 to 10000 ms,
+the minimum matches that deadline; for longer deadlines through 600000 ms it
+stays at 10000 ms, so a background wake every 10 s can remain. This is a timer
+interval in milliseconds, not a hardware reset guarantee.
+
+Keep Zephyr's normal `TASK_WDT_HW_FALLBACK=y` finite-timer path. The owner test
+graph pins Zephyr `10ba6d0cb38bc3d258775d27982f707599320085`. That revision
+initializes an empty channel set with `INT64_MAX` when fallback is off;
+its absolute-timeout encoding overflows with 64-bit timeouts. Strict UBSan
+reproduces this at `subsys/task_wdt/task_wdt.c:79`, including before any channel
+can be added. The owner avoids that path without patching Zephyr or disabling
+sanitizers. An unchanged `task_wdt_init(NULL)` supplies no hardware device.
+
+Explicit global fallback and minimum settings still override defaults. Other
+Task WDT clients must coordinate the global values and service initialization;
+a shorter explicit minimum can restore background wakes. Explicit fallback n
+is preserved as a configuration choice but is not an accepted runtime choice
+on this selected core. Disabling this owner or its freeze detector preserves
+Zephyr's ordinary minimum of 100 ms. No keyboard-specific workaround is needed.
+
+No new thread, buffer, timer, persistence or runtime allocation is introduced.
+The finite fallback path retains Zephyr's existing fallback state/code; inspect
+the selected linked map for costs. With 10 s channels fed every 5 s, actual
+Task WDT timer starts occur at initialization, channel arming and feeds, with
+no 100 ms expiries. The owner tests this under strict ASan/UBSan for one and
+two monitored queues. The original 100 ms configuration must fail its idle
+assertion, and fallback off must reproduce the named core overflow, each with
+three runs of its unchanged binary. Real board current, queue-stall recovery
+and USB/BLE/split/reset boundaries still require matching installed images.
+
 ## History and diagnostics
 
 Old v1/v2/v3 and current v4 records remain readable without rewriting or renumbering.
@@ -104,6 +151,14 @@ BLE observers do not log keys or peer addresses. Previous-boot CRC checkpoints
 remain separate from incidents and cannot identify a stopped PC. Copy before
 another reset. Keep the matching ELF and manifest with full `elf_sha256`; a tag
 alone is not image identity. Decode using `tools/decode_trace.py --help`.
+
+Keep original incident exports, captures and device/image matching records
+private. Raw incidents can contain application register words, thread names and
+code locations. Before sharing a selected report, inspect its contents,
+filenames and metadata for credentials, host/device identities and private
+paths. Use synthetic labels in a sanitized copy while retaining the original
+identity mapping, order, timestamps and retrieval errors privately. Preserve
+public project/API identifiers, licenses and attribution.
 
 Watchdog monitoring and capture are local to each half; no periodic split
 sharing is added. Only explicit Studio status/list/delete requests use the relay.
@@ -142,6 +197,16 @@ Read [the design](DESIGN.md), [test commands and limits](tests/README.md) and
 and Web checks specified there; build integration separately. Actual production
 USB/BLE/split, Flash, power/reset and retained-RAM acceptance require board evidence.
 Fault injection defaults off and belongs only in explicitly selected test builds.
+
+The selected DYA test revision fixes the three mock-event masks that caused
+the signed state-bit shift in `app/module/drivers/kscan/kscan_mock.c:103`.
+All five native fixtures passed strict ASan/UBSan with recovery disabled and
+three owner-verified repeats per binary. The exact original header remains a
+named control: the same five fixtures each reject its shift diagnostic in
+three repeats. Keep the exact profile, final compiler flags and original
+failure with the results, as described in `tests/README.md`. These results
+do not establish browser or physical acceptance, and the separate unsafe
+Task WDT fallback-off boundary remains documented above.
 
 
 ### USB boot diagnostic summaries

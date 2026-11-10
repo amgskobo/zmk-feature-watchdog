@@ -10,6 +10,12 @@ together.
   Distinguish invalid/stale/incomplete observations from healthy operation; a successful read or
   empty history does not authorize restart or prove stability.
 
+- Own Task WDT defaults for software-only monitoring. Avoid unused short background polling while
+  preserving defined empty-channel initialization, configured deadlines and queue-owned feed cadence.
+  Preserve explicit global overrides and ordinary defaults when this owner or its freeze detector
+  is disabled. Do not imply hardware reset coverage from a configuration bit when initialization
+  supplies no device. Keep default/bounds and real-kernel timer/detector regressions in this owner.
+
 - For custom Studio RPC use the declared fork/API. Update schema, firmware handler and Web client
   together, in that order. Set nanopb submessage `has_*` flags; with `CONFIG_NANOPB_WITHOUT_64BIT`,
   use 32-bit proto fields. Keep module parameters with the declared typed settings owner where

@@ -5,6 +5,15 @@ config ZMK_WATCHDOG
     select ZMK_LOW_PRIORITY_WORK_QUEUE
     select HWINFO
 
+# Modules are parsed before Zephyr's task_wdt defaults. Keep its finite
+# fallback timer path: this core overflows its absolute timeout sentinel at
+# task_wdt_init(NULL) with fallback off. Matching the monitor's deadline
+# avoids the unused 100-ms background wake without changing global overrides.
+config TASK_WDT_MIN_TIMEOUT
+    depends on TASK_WDT && TASK_WDT_HW_FALLBACK
+    default ZMK_WATCHDOG_FREEZE_TIMEOUT_MS if ZMK_WATCHDOG_FREEZE_DETECT && ZMK_WATCHDOG_FREEZE_TIMEOUT_MS <= 10000
+    default 10000 if ZMK_WATCHDOG_FREEZE_DETECT
+
 if ZMK_WATCHDOG
 
 config ZMK_WATCHDOG_MAX_INCIDENTS
@@ -112,7 +121,9 @@ config ZMK_WATCHDOG_FREEZE_DETECT
       than CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS, the channel records a
       FREEZE incident and reboots. Monitoring is armed during APPLICATION
       initialization and is software-only: a stop of the whole CPU or of its
-      interrupts is not detected.
+      interrupts is not detected. The Task WDT background interval defaults
+      to this deadline, capped at Zephyr's 10000-ms limit. Explicit global
+      settings still win; this module passes NULL and arms no hardware WDT.
 
 if ZMK_WATCHDOG_FREEZE_DETECT
 

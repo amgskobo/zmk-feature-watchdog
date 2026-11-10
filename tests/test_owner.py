@@ -29,12 +29,16 @@ def native_artifacts_env(name: str, owner_output: Path) -> dict[str, str]:
     return env
 
 
+def build_parallelism() -> int:
+    parallelism = int(os.environ.get("OWNER_TEST_BUILD_PARALLELISM", "1"))
+    if parallelism < 1:
+        raise ValueError("OWNER_TEST_BUILD_PARALLELISM must be a positive integer")
+    return parallelism
+
+
 def run_west(args: list[str]) -> subprocess.CompletedProcess[str]:
     if args and args[0] == "zmk-build":
-        parallelism = int(os.environ.get("OWNER_TEST_BUILD_PARALLELISM", "1"))
-        if parallelism < 1:
-            raise ValueError("OWNER_TEST_BUILD_PARALLELISM must be a positive integer")
-        args = [args[0], "--parallelism", str(parallelism), *args[1:]]
+        args = [args[0], "--parallelism", str(build_parallelism()), *args[1:]]
     return subprocess.run(
         ["west", *args],
         capture_output=True,
@@ -144,6 +148,7 @@ class WestCommandsTests(unittest.TestCase):
         self.assertEqual(result.stdout.count(": PASS"), 6)
 
     def test_common_context(self):
+        jobs = build_parallelism()
         zephyr = run_west(["list", "zephyr", "-f", "{abspath}"])
         self.assertEqual(zephyr.returncode, 0, zephyr.stderr)
         result = subprocess.run(
@@ -154,6 +159,8 @@ class WestCommandsTests(unittest.TestCase):
                 zephyr.stdout.strip(),
                 "--output",
                 str(self.BUILD_DIR / "common-context"),
+                "--jobs",
+                str(jobs),
             ],
             cwd=THIS_DIR,
             capture_output=True,
@@ -253,6 +260,34 @@ class WestCommandsTests(unittest.TestCase):
                         "DT_COMPAT_HAS_OKAY_zmk_keymap",
                     ],
                 ),
+                "module_watchdog_task_wdt_external": ConfigAndDeviceTree(
+                    config=[
+                        "# CONFIG_ZMK_WATCHDOG is not set",
+                        "CONFIG_TASK_WDT=y",
+                        "CONFIG_TASK_WDT_HW_FALLBACK=y",
+                        "CONFIG_TASK_WDT_MIN_TIMEOUT=100",
+                    ],
+                    device=[],
+                ),
+                "module_watchdog_freeze_disabled": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_ZMK_WATCHDOG=y",
+                        "# CONFIG_ZMK_WATCHDOG_FREEZE_DETECT is not set",
+                        "CONFIG_TASK_WDT=y",
+                        "CONFIG_TASK_WDT_HW_FALLBACK=y",
+                        "CONFIG_TASK_WDT_MIN_TIMEOUT=100",
+                    ],
+                    device=[],
+                ),
+                "module_watchdog_explicit_fallback": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_ZMK_WATCHDOG=y",
+                        "CONFIG_ZMK_WATCHDOG_FREEZE_DETECT=y",
+                        "CONFIG_TASK_WDT_HW_FALLBACK=y",
+                        "CONFIG_TASK_WDT_MIN_TIMEOUT=100",
+                    ],
+                    device=[],
+                ),
                 "module_watchdog_board_with_rpc": ConfigAndDeviceTree(
                     config=[
                         "CONFIG_ZMK_STUDIO=y",
@@ -265,18 +300,9 @@ class WestCommandsTests(unittest.TestCase):
                         "CONFIG_ZMK_WATCHDOG_CAPTURE_CONTEXT=y",
                         "CONFIG_EXTRA_EXCEPTION_INFO=y",
                         "CONFIG_TASK_WDT=y",
-                        # CONFIG_TASK_WDT_HW_FALLBACK defaults to y upstream
-                        # whenever CONFIG_TASK_WDT=y, regardless of our own
-                        # (removed) Kconfig -- but src/watchdog_freeze.c
-                        # always calls task_wdt_init(NULL), so the hardware
-                        # watchdog code in subsys/task_wdt/task_wdt.c (all
-                        # gated behind `if (hw_wdt)`) never actually runs.
-                        # At the selected revision its background *software*
-                        # timer still runs at TASK_WDT_MIN_TIMEOUT: this
-                        # default is not evidence of hardware reset coverage
-                        # and is not inert timer overhead (DESIGN.md,
-                        # Capture and monitoring). The Studio RPC TX path
-                        # stays at its framework default.
+                        # Keep the finite timer path, with no 100-ms wake.
+                        "CONFIG_TASK_WDT_HW_FALLBACK=y",
+                        "CONFIG_TASK_WDT_MIN_TIMEOUT=10000",
                         "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=64",
                     ],
                     device=[],
@@ -381,6 +407,51 @@ class WestCommandsTests(unittest.TestCase):
             }
         )
 
+    def test_task_wdt_defaults(self):
+        result = subprocess.run(
+            [
+                "python3",
+                "tests/task_wdt_defaults.py",
+                "--workspace",
+                str(self.WEST_TOPDIR),
+                "--output",
+                str(self.BUILD_DIR / "task-wdt-defaults"),
+            ],
+            cwd=THIS_DIR,
+            capture_output=True,
+            text=True,
+        )
+        (self.BUILD_DIR / "test_task_wdt_defaults.log").write_text(
+            result.stdout + result.stderr
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "nine actual Kconfig cases; old-default control rejected", result.stdout
+        )
+
+    def test_task_wdt_idle(self):
+        result = subprocess.run(
+            [
+                "python3",
+                "tests/task-wdt-idle/run.py",
+                "--workspace",
+                str(self.WEST_TOPDIR),
+                "--output",
+                str(self.BUILD_DIR / "task-wdt-idle"),
+            ],
+            cwd=THIS_DIR,
+            capture_output=True,
+            text=True,
+        )
+        (self.BUILD_DIR / "test_task_wdt_idle.log").write_text(
+            result.stdout + result.stderr
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "two idle timer variants x3; old-100ms and unsafe-fallback-off controls x3",
+            result.stdout,
+        )
+
     def _test_zmk_build(
         self, artifacts_and_expected_build_params: dict[str, ConfigAndDeviceTree]
     ):
@@ -412,15 +483,27 @@ class WestCommandsTests(unittest.TestCase):
                 config_path, entries.config, f"{artifact} config"
             )
             if "CONFIG_ZMK_WATCHDOG=y" in entries.config:
+                effective = config_path.read_text().splitlines()
                 self._test_strings_in_file(
                     config_path,
-                    [
-                        "CONFIG_ZMK_WATCHDOG_FREEZE_TRACE=y",
-                        "CONFIG_THREAD_STACK_INFO=y",
-                        "CONFIG_ZMK_WATCHDOG_DIAGNOSTICS=y",
-                    ],
+                    ["CONFIG_ZMK_WATCHDOG_DIAGNOSTICS=y"],
                     f"{artifact} freeze trace",
                 )
+                if "CONFIG_ZMK_WATCHDOG_FREEZE_DETECT=y" in effective:
+                    self._test_strings_in_file(
+                        config_path,
+                        [
+                            "CONFIG_ZMK_WATCHDOG_FREEZE_TRACE=y",
+                            "CONFIG_THREAD_STACK_INFO=y",
+                            "CONFIG_TASK_WDT_HW_FALLBACK=y",
+                            (
+                                "CONFIG_TASK_WDT_MIN_TIMEOUT=100"
+                                if artifact == "module_watchdog_explicit_fallback"
+                                else "CONFIG_TASK_WDT_MIN_TIMEOUT=10000"
+                            ),
+                        ],
+                        f"{artifact} software monitor defaults",
+                    )
             if entries.device:
                 self._test_strings_in_file(
                     device_tree_path, entries.device, f"{artifact} device tree"

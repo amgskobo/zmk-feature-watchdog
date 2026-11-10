@@ -1,17 +1,21 @@
 {
   "schema": 1,
   "owner": "zmk-watchdog-fork",
-  "supported_cores": ["dya"],
+  "supported_cores": [
+    "dya"
+  ],
   "unsupported_core_status": "NOT APPLICABLE",
   "commands": [
     "python3 -m unittest discover -v -s tests -p test_owner.py",
     "python3 tests/relay-central/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT; single/multiple capacity, rejected targets, transport errors, nonzero ID wrap, identical binaries three times",
-    "python3 tests/context/run.py --zephyr RESOLVED_ZEPHYR --output FRESH_ABSOLUTE_OUTPUT; two native variants three times; missing-publication and assert-clock controls each rejected three times",
+    "python3 tests/context/run.py --zephyr RESOLVED_ZEPHYR --output FRESH_ABSOLUTE_OUTPUT --jobs 1; two native variants three times; missing-publication and assert-clock controls each rejected three times",
     "python3 tests/trace/run.py --workspace RESOLVED_WORKSPACE --artifacts FRESH_OUTPUT; repeat with --assert-context and another fresh output, same Cortex-M ELF three times per variant",
     "bash tests/run-web.sh",
     "python3 -m unittest discover -v -s tests/decoder; retain primary evidence and raw optional captures on per-record errors, reject invalid report shapes and continue after malformed incidents/details; preserve ELF/build-tag refusal",
     "python3 tests/relay-stack/run.py --zephyr ZEPHYR --cmsis CMSIS --nanopb NANOPB --zmk RESOLVED_DYA --artifacts NEW_OUTPUT; real Cortex-M peripheral relay stack boundary, also in test_owner.",
-    "python3 -m unittest discover -s tests -p test_retirement.py -v"
+    "python3 -m unittest discover -s tests -p test_retirement.py -v",
+    "python3 tests/task_wdt_defaults.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT",
+    "python3 tests/task-wdt-idle/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT"
   ],
   "coverage_map": "tests/README.md",
   "relay_request_admission": "tests/relay-stack: original7relay/3reporter groups plus queued2/running3/FIFO-full correlatedbusy/recovery and malformed-head/page/status tail; worker and producer2KiB, same344B downstream and128B sampled headroom, each ELF3times.",
@@ -30,15 +34,24 @@
   },
   "gaps": [
     "Physical USB/BLE/split delivery, timing, power and retention require matching production-board evidence.",
-    "At pinned DYA e5c9b6915b56801193e359dd9bad4a167ce0d1b8, all five native mock fixtures diagnose kscan_mock.c:103 signed 1 << 31 in combined ASan/UBSan. The clean gate is BLOCKED: strict CONFIG_ASAN_RECOVER=n runs exit1; recovering runs exit0 with matching snapshots, and both are rejected by the owner verifier. The selected Zephyr adds a later -fsanitize-recover=all when ASAN_RECOVER=y, so final compiler flags must be verified. Each profile retains identical binaries and three independent runs; ASan-only/optimized/ARM results are separate.",
     "The relay-stack fixture exercises actual DYA event dispatch with a declared 344-byte downstream stack budget and serialized worker response storage. This model does not establish actual BT/radio delivery or kernel worst-case stack use. Physical retrieval histories remain private; congestion, power and long-run acceptance require matching production-board evidence.",
-    "Performance/health measurement retired; source and unique assertions archived per tests/retired-measurements.md. No new physical verdict."
+    "Performance/health measurement retired; source and unique assertions archived per tests/retired-measurements.md. No new physical verdict.",
+    "Selected Zephyr 10ba6d0cb38bc3d258775d27982f707599320085 overflows K_TIMEOUT_ABS_TICKS(INT64_MAX) during empty-channel task_wdt_init(NULL) with fallback n and 64-bit timeouts (task_wdt.c:79). Reproduced x3 in three owner mock fixtures; the normal default keeps fallback y and matches minimum to the monitor deadline. Exact rejected fallback-off proposal/assertions and raw failures are retained externally in the 2026-11-09 migration evidence; direct tests map to task-wdt-idle unsafe-fallback-off and Kconfig explicit-n/old100 cases. No physical claim."
   ],
   "native_verification": "tests/native_verifier.py: actual exit, recoverable ASan/UBSan diagnostic rejection, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times. Fourteen real-ELF controls preserve the original eleven; two recovering faults prove exit 0 independently before requiring rejection, and benign sanitizer option/status names remain accepted.",
+  "native_mock_sanitizer": {
+    "selected_dya": "9f75b536cff5a63d34cba43de9be8652b8bd1915",
+    "source_availability": "Reviewed local commit, unpushed and NOT RETRIEVABLE from the declared https://github.com/cormoran/zmk source; remote-only preparation is BLOCKED until separately published.",
+    "fixed_gate": "Three mock event masks use an unsigned state bit. All five native fixtures passed strict ASan/UBSan with CONFIG_ASAN_RECOVER=n and three owner-verified repeats per identical binary.",
+    "original_control": "Exact e5c9b6915b56801193e359dd9bad4a167ce0d1b8 header: the same five fixtures each reject kscan_mock.c:103 signed 1 << 31 in three strict repeats. Historical recovering exit0/snapshot matches remain rejected by the owner verifier.",
+    "profile_boundary": "Verify final compiler flags: selected Zephyr adds a later -fsanitize-recover=all when ASAN_RECOVER=y. ASan-only, optimized, ARM, browser and physical results are separate. The Task WDT fallback-off overflow remains an independent documented limit."
+  },
+  "build_resource_forwarding": "OWNER_TEST_BUILD_PARALLELISM remains the single positive owner target/context job budget. Actual board/context dispatch controls cover default, explicit1/2 and invalid settings before child launch; all kernel variants and original assertions remain. The prior context entry without --jobs is the failing original control.",
   "identity_dependencies": "tests/decoder/test_build_identity.py: selected peripheral context header belongs to the digest and CMake configure dependencies; a header-only edit regenerates identity; central/disabled selections stay independent.",
   "timeout_width": {
     "entry": "python3 -m unittest discover -s tests -p test_timeout_width.py -v",
     "contract": "Full uint32 milliseconds, exact ceiling and configured kernel tick ABI; independent wide oracle and identified math/width controls",
     "physical": "NOT RUN"
-  }
+  },
+  "software_task_wdt_defaults": "Owner default TASK_WDT_MIN_TIMEOUT=min(freeze deadline,10000 ms) only while freeze monitoring is enabled; preserve explicit global overrides and external/disabled 100-ms default. Nine actual board Kconfig cases and specified earlier-100 control. Normal board artifacts require fallback y/min10000. Strict ASan/UBSan idle fixture: actual owner initializer/feed work and real kernel timer, one/two queues x3, idle quiescence and 5-s feeds/10-s deadline; old100 fails its named assertion, unsafe fallback-off fails named core overflow x3 each. Existing preblocked queue ISR fixture uses finite min100 matching its channel; no core patch or sanitizer disabling."
 }

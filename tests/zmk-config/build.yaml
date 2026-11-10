@@ -3,6 +3,21 @@ include:
     board: xiao_ble//zmk
     shield: tester_xiao
 
+  - artifact: module_watchdog_task_wdt_external
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_WATCHDOG=n -DCONFIG_TASK_WDT=y
+
+  - artifact: module_watchdog_freeze_disabled
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_WATCHDOG=y -DCONFIG_ZMK_WATCHDOG_FREEZE_DETECT=n -DCONFIG_TASK_WDT=y
+
+  - artifact: module_watchdog_explicit_fallback
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_WATCHDOG=y -DCONFIG_TASK_WDT_HW_FALLBACK=y -DCONFIG_TASK_WDT_MIN_TIMEOUT=100
+
   - artifact: module_watchdog_board_with_rpc
     board: xiao_ble//zmk
     shield: tester_xiao
