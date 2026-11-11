@@ -1,0 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Named control: select the original, unchanged upstream mock device. */
+&kscan {
+    compatible = "zmk,kscan-mock";
+};

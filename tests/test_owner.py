@@ -16,6 +16,8 @@ from test_qemu_capture import QemuCapture as QemuCapture
 from test_store_mutations import StoreMutationSelectors as StoreMutationSelectors
 
 from test_build_budget import BuildBudgetContract as BuildBudgetContract
+from test_native_input import NativeInputContract as NativeInputContract
+from decoder.test_build_identity import BuildIdentityTests as BuildIdentityTests
 
 THIS_DIR = Path(__file__).resolve().parent.parent
 TEST_BUILD_DIR_NAME = "tests-zmk-feature-watchdog"
@@ -109,6 +111,30 @@ class WestCommandsTests(unittest.TestCase):
                 "watchdog_rpc_inject_freeze_recorded",
             ]:
                 self.assertIn("PASS: " + marker, studio_log)
+
+    @unittest.skipUnless(platform.system() == "Linux", "native controls require Linux")
+    def test_original_mock_expected_rejections(self):
+        result = subprocess.run(
+            [
+                "python3",
+                "tests/native-input/run_controls.py",
+                "--workspace",
+                str(self.WEST_TOPDIR),
+                "--output",
+                str(self.BUILD_DIR / "original-core-mock"),
+            ],
+            cwd=THIS_DIR,
+            capture_output=True,
+            text=True,
+        )
+        (self.BUILD_DIR / "test_original_mock_expected_rejections.log").write_text(
+            result.stdout + result.stderr
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "EXPECTED_CORE_MOCK_REJECTIONS fixtures=5 repeats=3 qualified=15",
+            result.stdout,
+        )
 
     @unittest.skipUnless(
         platform.system() == "Linux", "native kernel checks require Linux"
@@ -481,6 +507,26 @@ class WestCommandsTests(unittest.TestCase):
             )
             self._test_strings_in_file(
                 config_path, entries.config, f"{artifact} config"
+            )
+            self.assertNotIn(
+                "CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE=y",
+                config_path.read_text().splitlines(),
+                f"{artifact}: native input fixture selected on a board",
+            )
+            self.assertNotIn(
+                "CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE=y",
+                config_path.read_text().splitlines(),
+                f"{artifact}: native sanitizer fixture selected on a board",
+            )
+            self.assertNotIn(
+                "amgskobo_watchdog_test_kscan",
+                device_tree_path.read_text(),
+                f"{artifact}: native input devicetree on a board",
+            )
+            self.assertNotIn(
+                "/tests/native-input/kscan.c",
+                (artifact_dir.parent / "build.ninja").read_text(),
+                f"{artifact}: native input source compiled on a board",
             )
             if "CONFIG_ZMK_WATCHDOG=y" in entries.config:
                 effective = config_path.read_text().splitlines()

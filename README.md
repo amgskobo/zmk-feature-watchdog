@@ -16,12 +16,10 @@ its URL, full commit and working-source identity, and validate that combination
 separately rather than treating the manifest pin as its resolved input.
 
 The isolated test manifest selects DYA
-`9f75b536cff5a63d34cba43de9be8652b8bd1915` from the declared
-`https://github.com/cormoran/zmk` source. This exact revision is a reviewed
-local commit and is not yet pushed or remotely retrievable. A fresh setup
-using only that remote is BLOCKED until the source is available; a prepared
-local workspace must contain the exact commit and complete imported graph.
-Local commits and passing checks do not publish the source.
+`e5c9b6915b56801193e359dd9bad4a167ce0d1b8` from
+`https://github.com/cormoran/zmk`. Keep that core unchanged and resolve its
+complete imported graph. The native tests select an explicit owner input
+fixture; they do not patch the upstream mock or require a local core commit.
 
 Records workqueue freezes, fatal errors and selected reset causes. Each split
 half owns its store. Optional custom Studio RPC reads/deletes local records or
@@ -198,15 +196,28 @@ and Web checks specified there; build integration separately. Actual production
 USB/BLE/split, Flash, power/reset and retained-RAM acceptance require board evidence.
 Fault injection defaults off and belongs only in explicitly selected test builds.
 
-The selected DYA test revision fixes the three mock-event masks that caused
-the signed state-bit shift in `app/module/drivers/kscan/kscan_mock.c:103`.
-All five native fixtures passed strict ASan/UBSan with recovery disabled and
-three owner-verified repeats per binary. The exact original header remains a
-named control: the same five fixtures each reject its shift diagnostic in
-three repeats. Keep the exact profile, final compiler flags and original
-failure with the results, as described in `tests/README.md`. These results
-do not establish browser or physical acceptance, and the separate unsafe
-Task WDT fallback-off boundary remains documented above.
+The selected unchanged DYA core still has a signed state-bit shift in its
+test-only `app/module/drivers/kscan/kscan_mock.c:103` path. Watchdog's five native
+scenarios instead select `CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE` and a
+distinct test device using public Kscan callbacks. Literal input/order and
+completion checks supplement the original unchanged snapshots and C assertions.
+Two fixtures deliver their configured input: `test` retains the actual core
+keymap/HID Press A/release path, and `split_peripheral` retains callbacks and
+its existing relay assertions without host HID. The original `watchdog`,
+`studio` and `studio_unsecured` tests deliberately wedge sysworkq at APPLICATION
+99 before the first 10 ms input callback, then exit before main. Their input
+completion is NOT APPLICABLE; original freeze/checked-init/exit/snapshot
+assertions and an observed zero-input/no-main terminal outcome remain mandatory.
+Strict ASan/UBSan remains enabled with recovery disabled.
+`CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE` supplies both runtimes to
+native_sim's separate final host link; both native fixture flags stay off on
+production boards. Separate named controls select the original unchanged core
+mock and require its precise shift
+diagnostic in three runs per binary. Those expected failures are not product
+successes or a repair of the upstream driver. Keep final compiler flags and raw
+failures with results; see [test limits](tests/README.md). GPIO/radio/browser and
+physical acceptance, and the separate unsafe Task WDT fallback-off boundary,
+remain independent.
 
 
 ### USB boot diagnostic summaries

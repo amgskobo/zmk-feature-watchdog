@@ -8,6 +8,13 @@ import re
 import subprocess
 import time
 
+from native_input import (
+    load_input_oracles,
+    require_native_runtime_libraries,
+    verify_input_build,
+    verify_input_trace,
+)
+
 
 def enabled_config(path):
     return set(re.findall(r"^(CONFIG_\w+)=y$", path.read_text(), re.M))
@@ -64,6 +71,14 @@ def verify_native(output: Path, tests: Path):
         raise AssertionError(f"missing native fixtures: {sorted(expected - actual)}")
     if actual - expected:
         raise AssertionError(f"unknown native fixtures: {sorted(actual - expected)}")
+    input_oracles = None
+    if any(
+        "CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE"
+        in enabled_config(path / "native_sim.conf")
+        for path in (tests / case for case in expected)
+    ):
+        input_oracles = load_input_oracles(tests, expected)
+    identity_nonces = set()
     for binary in binaries:
         symbols = subprocess.check_output(
             ["nm", "--defined-only", str(binary)], text=True
@@ -76,9 +91,47 @@ def verify_native(output: Path, tests: Path):
         missing = set(required_hooks(binary, fixture, tests)) - set(hooks)
         if missing:
             raise AssertionError(f"{case}: missing checked init {sorted(missing)}")
+        if input_oracles is not None:
+            verify_input_build(binary, input_oracles[case])
         destination = binary.parent.parent / "verified-runs"
         destination.mkdir(exist_ok=False)
+        if input_oracles is not None:
+            dynamic = subprocess.run(
+                ["readelf", "--dynamic", str(binary)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            (destination / "runtime-link.log").write_text(
+                dynamic.stdout + dynamic.stderr
+            )
+            require_native_runtime_libraries(dynamic.stdout)
         binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+        if "CONFIG_ZMK_WATCHDOG_DIAGNOSTICS" in enabled_config(
+            binary.parent / ".config"
+        ):
+            identities = list(
+                binary.parent.parent.rglob("watchdog-build-identity.json")
+            )
+            if len(identities) != 1:
+                raise AssertionError(f"{case}: missing/duplicate diagnostic identity")
+            identity = json.loads(identities[0].read_text())
+            nonce = identity["configuration_nonce"]
+            if not re.fullmatch(r"[0-9a-f]{32}", nonce) or nonce in identity_nonces:
+                raise AssertionError(f"{case}: invalid/reused configuration nonce")
+            identity_nonces.add(nonce)
+            if input_oracles is not None:
+                for name in ["tests/native-input/kscan.c", "tests/native-input/word.h"]:
+                    actual_digest = hashlib.sha256(
+                        (tests.parent / name).read_bytes()
+                    ).hexdigest()
+                    if identity["inputs"].get(name) != actual_digest:
+                        raise AssertionError(
+                            f"{case}: input fixture missing from build identity: {name}"
+                        )
+            (destination / "watchdog-build-manifest.json").write_text(
+                json.dumps({**identity, "elf_sha256": binary_hash}, indent=2) + "\n"
+            )
         (destination / "inputs.json").write_text(
             json.dumps(
                 {
@@ -148,7 +201,23 @@ def verify_native(output: Path, tests: Path):
                 raise AssertionError(f"{case}: sanitizer diagnostic; see {run}")
             if re.search(r"\bFAIL:", raw):
                 raise AssertionError(f"{case}: failed owner assertion; see {run}")
+            input_observation = None
+            if input_oracles is not None:
+                input_observation = verify_input_trace(raw, input_oracles[case])
+                (run / "input-boundary.json").write_text(
+                    json.dumps(input_observation, indent=2) + "\n"
+                )
             for hook in hooks:
+                # This newly-added asynchronous probe cannot execute after the
+                # three original APP99 tests permanently wedge sysworkq and exit.
+                # The case-specific terminal/zero-input proof above is mandatory;
+                # every original or unknown checked hook remains checked below.
+                if (
+                    hook == "watchdog_native_input_complete"
+                    and input_observation is not None
+                    and input_observation["input_status"] == "NOT APPLICABLE"
+                ):
+                    continue
                 values = re.findall(
                     r"OWNER_TEST_RESULT " + re.escape(hook) + r"=(-?\d+)", raw
                 )

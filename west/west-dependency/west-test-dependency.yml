@@ -8,7 +8,7 @@ manifest:
   projects:
     - name: zmk
       remote: cormoran
-      revision: 9f75b536cff5a63d34cba43de9be8652b8bd1915
+      revision: e5c9b6915b56801193e359dd9bad4a167ce0d1b8
       import:
         file: app/west.yml
       clone-depth: 1

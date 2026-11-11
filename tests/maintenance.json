@@ -15,7 +15,8 @@
     "python3 tests/relay-stack/run.py --zephyr ZEPHYR --cmsis CMSIS --nanopb NANOPB --zmk RESOLVED_DYA --artifacts NEW_OUTPUT; real Cortex-M peripheral relay stack boundary, also in test_owner.",
     "python3 -m unittest discover -s tests -p test_retirement.py -v",
     "python3 tests/task_wdt_defaults.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT",
-    "python3 tests/task-wdt-idle/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT"
+    "python3 tests/task-wdt-idle/run.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT",
+    "python3 tests/native-input/run_controls.py --workspace RESOLVED_WORKSPACE --output FRESH_OUTPUT; unchanged e5 core mock, five compiled controls each reject only the named signed-shift diagnostic three times"
   ],
   "coverage_map": "tests/README.md",
   "relay_request_admission": "tests/relay-stack: original7relay/3reporter groups plus queued2/running3/FIFO-full correlatedbusy/recovery and malformed-head/page/status tail; worker and producer2KiB, same344B downstream and128B sampled headroom, each ELF3times.",
@@ -40,14 +41,15 @@
   ],
   "native_verification": "tests/native_verifier.py: actual exit, recoverable ASan/UBSan diagnostic rejection, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times. Fourteen real-ELF controls preserve the original eleven; two recovering faults prove exit 0 independently before requiring rejection, and benign sanitizer option/status names remain accepted.",
   "native_mock_sanitizer": {
-    "selected_dya": "9f75b536cff5a63d34cba43de9be8652b8bd1915",
-    "source_availability": "Reviewed local commit, unpushed and NOT RETRIEVABLE from the declared https://github.com/cormoran/zmk source; remote-only preparation is BLOCKED until separately published.",
-    "fixed_gate": "Three mock event masks use an unsigned state bit. All five native fixtures passed strict ASan/UBSan with CONFIG_ASAN_RECOVER=n and three owner-verified repeats per identical binary.",
-    "original_control": "Exact e5c9b6915b56801193e359dd9bad4a167ce0d1b8 header: the same five fixtures each reject kscan_mock.c:103 signed 1 << 31 in three strict repeats. Historical recovering exit0/snapshot matches remain rejected by the owner verifier.",
-    "profile_boundary": "Verify final compiler flags: selected Zephyr adds a later -fsanitize-recover=all when ASAN_RECOVER=y. ASan-only, optimized, ARM, browser and physical results are separate. The Task WDT fallback-off overflow remains an independent documented limit."
+    "selected_dya": "e5c9b6915b56801193e359dd9bad4a167ce0d1b8",
+    "core_boundary": "Upstream core remains unchanged. Its original test-only mock signed-shift fault is not repaired or cleared by owner input-fixture results.",
+    "owner_input_gate": "All five scenarios select the native-only owned backend with original configured DT word vectors/bindings/snapshots/C assertions/checked initialization/role gates and strict profiles. Exactly2 deliver input: test covers actual core keymap/HID PressA/release, split_peripheral covers callbacks plus its unchanged relay assertions and no host HID. Exactly3 original APP99 tests (watchdog/studio/studio_unsecured) permanently wedge sysworkq at0ms before the first10ms callback and intentionally exit before main: require original terminal freeze PASS, successful original checked result, exit0, zero input/completion/HID and no main Welcome. Only the newly-added async completion hook is explicitly input NOT APPLICABLE there; all original/unknown checked hooks remain mandatory.",
+    "original_control": "Public test-owned overlay selects the unchanged original core mock, with only owner input backend disabled. Each of five ELF controls must compile then reject kscan_mock.c:103 signed 1 << 31 in three independent-flash runs. Different/setup/build failures do not qualify and expected rejections are separate from product PASS.",
+    "profile_boundary": "All five native configs require combined ASan/UBSan, CONFIG_ASAN_RECOVER=n and CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE. The owner-only public native_simulator link profile supplies final-runner runtimes; actual NSI options, ELF runtime dependencies, application compiler flags and raw diagnostic rejection are required. No suppression or dependency rewriting. Both native fixture flags/sources are absent on production roles. Task WDT fallback-off overflow and hardware/browser acceptance remain separate.",
+    "fixture_limit": "Owned scripted Kscan callback boundary, not upstream-mock/physical GPIO/radio/scheduling-fidelity acceptance. Two exercised versus three pre-main blocked-delivery cases are distinct; no barrier, init reorder or timing change. Original unique assertions/input archives and invalid all5-completion full03 failure/replacement map remain private migration evidence."
   },
   "build_resource_forwarding": "OWNER_TEST_BUILD_PARALLELISM remains the single positive owner target/context job budget. Actual board/context dispatch controls cover default, explicit1/2 and invalid settings before child launch; all kernel variants and original assertions remain. The prior context entry without --jobs is the failing original control.",
-  "identity_dependencies": "tests/decoder/test_build_identity.py: selected peripheral context header belongs to the digest and CMake configure dependencies; a header-only edit regenerates identity; central/disabled selections stay independent.",
+  "identity_dependencies": "tests/decoder/test_build_identity.py: selected peripheral context header belongs to the digest and CMake configure dependencies; a header-only edit regenerates identity; central/disabled selections stay independent. The selected native driver/header/profile/binding and fixture metadata are hashed, with quoted includes followed inside owner tests. Zephyr owns DTS/keymap/conf configure dependencies; an actual-CMake ../ alias regression preserves valid Ninja generation. Unselected native sources/profile do not alter production identity; fresh nonce plus full-ELF binding remain required.",
   "timeout_width": {
     "entry": "python3 -m unittest discover -s tests -p test_timeout_width.py -v",
     "contract": "Full uint32 milliseconds, exact ceiling and configured kernel tick ABI; independent wide oracle and identified math/width controls",

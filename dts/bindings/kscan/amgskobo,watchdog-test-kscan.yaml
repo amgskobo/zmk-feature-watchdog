@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+description: Watchdog owner native test input, not a physical keyboard driver
+compatible: "amgskobo,watchdog-test-kscan"
+include: base.yaml
+properties:
+  rows:
+    type: int
+    required: true
+  columns:
+    type: int
+    required: true
+  events:
+    type: array
+    required: true
+  exit-after:
+    type: boolean

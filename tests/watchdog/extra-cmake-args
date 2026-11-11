@@ -1,0 +1,3 @@
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+-DEXTRA_CFLAGS=-fsanitize=address,undefined;-fno-sanitize-recover=all
+-DEXTRA_LDFLAGS=-fsanitize=address,undefined;-fno-sanitize-recover=all

@@ -403,20 +403,18 @@ owner matrix. No network updates are implicit in the owner test command.
 ## Reproducible isolated checks
 
 Use this owner's `west/west-test-isolated.yml` and its pinned test dependency
-manifest. Test ZMK is `9f75b536cff5a63d34cba43de9be8652b8bd1915`;
+manifest. Test ZMK is unchanged `e5c9b6915b56801193e359dd9bad4a167ce0d1b8`;
 Zephyr is `10ba6d0cb38bc3d258775d27982f707599320085`. Resolve the
 manifest and verify actual checkout identities before running. Do not inherit
 global CMake module overrides or moving production dependency references into
 these isolated fixtures. The CI SDK image is pinned by digest in
 `.github/workflows/zmk-module.yml`; production dependency manifests are separate.
 
-The selected DYA revision is a reviewed local commit, not yet pushed or
-remotely retrievable from the declared `https://github.com/cormoran/zmk`
-source. Remote-only preparation is BLOCKED until that source is available.
-Offline prepared workspaces must already contain the exact commit and the
-complete Git-backed import graph. Set the workspace's runtime-only
-`manifest-rev` project ref to that selection when preparing copied metadata;
-do not alter an authoring checkout or substitute an older revision.
+Prepared workspaces must contain that exact upstream commit and the complete
+Git-backed import graph. Source availability is a separate check from local
+tests. Do not patch the core, substitute a local core commit or change an
+authoring checkout to clear a fixture failure. Byte-verified isolated runtime
+inputs and their metadata are separate from authoring checkouts.
 
 Use a new `OWNER_TEST_OUTPUT` directory for every complete owner run. Native
 repeats reuse one compiled binary with independent initial-flash state; keep
@@ -536,23 +534,70 @@ Ordinary sanitizer configuration names and synthetic application markers remain
 accepted. Retained raw diagnostics take precedence over successful process,
 initialization and snapshot results.
 
-The selected DYA test core `9f75b536cff5a63d34cba43de9be8652b8bd1915`
-uses unsigned state-bit masks for all three mock-event encodings. All five
-native fixtures passed combined strict ASan/UBSan with three owner-verified
-repeats per binary. The exact original header from
-`e5c9b6915b56801193e359dd9bad4a167ce0d1b8` is a named control: all five
-fixtures reject its signed `1 << 31` diagnostic at
-`app/module/drivers/kscan/kscan_mock.c:103` in three repeats per binary.
-Historical recovering runs exit 0 with matching snapshots despite the
-diagnostic; the owner verifier rejects those as well as strict failures.
-A strict configuration also requires `CONFIG_ASAN_RECOVER=n`: the selected
-Zephyr POSIX backend otherwise appends `-fsanitize-recover=all` after
-`EXTRA_CFLAGS`, overriding an earlier `-fno-sanitize-recover=all`. Check the final
-compiler arguments and real process output when selecting a profile. The fixed
-strict profiles retain the complete fixtures and feature gates; ASan-only,
-optimized and ARM results retain their own scope. A further core-pin change
-requires revalidation. This resolves the mock-header gate locally; source
-availability, browser and physical gates remain separate.
+The selected unchanged DYA core retains its test-only mock's signed `1 << 31`
+fault. The five owner native scenarios select a distinct
+`amgskobo,watchdog-test-kscan` device and
+`CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE`, which depends on native_sim and
+that compatible. The companion `CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE`
+depends on native_sim and ASan and supplies the declared strict runtimes to the
+public `native_simulator` target's separate final host link. Application
+instrumentation and recovery-off flags remain enabled. Both flags are forbidden
+in production roles. The driver, link profile and independent literal
+vectors/oracles live in `tests/native-input/`; only the binding and native-only
+build gates are outside tests. No production role may select either flag, the
+compatible or the driver source.
+The existing DT event words, bindings, five snapshots, filters, C assertions,
+checked initialization and feature/role gates are retained. Two cases exercise
+input delivery: `test` uses the actual core physical-layout/event/keymap/HID
+Press A/release path; `split_peripheral` retains callbacks and its existing relay
+assertions, with no host HID claim. The other three cases retain their original
+pre-main terminal-freeze contract. This is an owner input-boundary fixture,
+not upstream mock, physical GPIO or radio fidelity evidence.
+
+`native_input.py` requires each callback's literal word, row, column, state,
+delay and order and exactly one completion after all callbacks in the two
+input-delivery cases, plus the independent Press A/release oracle in `test`.
+It also verifies all five compiled
+fixture source, effective config/DTS and strict ASan/UBSan application flags.
+Actual NSI link options and both ELF runtime-library dependencies are checked;
+successful process runs and the precise original-core fault confirm execution
+beyond final linkage. Selected input/profile sources are bound into diagnostic
+identity, with a fresh configuration nonce and post-link full-ELF hash. Zephyr
+owns keymap/DTS/conf reconfiguration dependencies; adding normalized duplicates
+of its quoted-include aliases can create an invalid Ninja graph. Additional
+selected driver/header/profile dependencies remain owner-managed and tested.
+The verifier still requires every original assertion/checked result and the
+unchanged snapshots in three independent-flash runs per identical binary.
+In `watchdog`, `studio` and `studio_unsecured`, core APPLICATION90 initializes
+and enables Kscan, but the original APPLICATION99 test queues a permanent
+sysworkq stall at time zero, before the first 10 ms callback. After proving the
+freeze, those tests intentionally exit before main. Require the final freeze
+PASS before exactly one successful original checked result and exit 0, zero
+input/completion/HID records and no main Welcome. Only the newly-added
+asynchronous input-completion probe is NOT APPLICABLE there; every original or
+unknown checked hook remains mandatory. Do not reorder initialization or the
+freeze scenario to make input execute. The literal configured DT word vectors
+remain checked even for these three unreachable-delivery cases.
+Decoder boundary cases and callback/order/completion/HID rejection controls run
+in `test_native_input.py`; a missing or zero-event producer cannot pass merely
+because an RPC/peripheral snapshot filters out key logs.
+
+`tests/native-input/run_controls.py` separately builds all five scenarios using
+a public DT overlay selecting the original unchanged core mock and a config
+fragment disabling only the owner input backend. Original Watchdog role/test
+gates remain. Each compiled ELF must exit nonzero on the precise
+`kscan_mock.c:103` signed-shift diagnostic in three independent-flash runs.
+The runner verifies both core source files against the selected e5 Git objects
+before and after; no source rewriting or dependency patch is involved.
+Build/setup failures or different diagnostics do not qualify, and expected
+control rejections are reported separately from product results.
+
+All five native configurations enable ASan plus UBSan and
+`CONFIG_ASAN_RECOVER=n`. The selected Zephyr POSIX backend otherwise appends
+`-fsanitize-recover=all` after `EXTRA_CFLAGS`. Verify the final arguments and raw
+output; historical recovering exit-0/snapshot matches remain rejected. ASan-only,
+optimized, ARM, browser and physical results have separate scopes. No core mock
+repair or physical acceptance is claimed.
 
 `bash tests/run-web.sh` is the canonical schema-generation/Web test entry.
 It runs all configured Jest scenarios in one worker process. The pre-commit
@@ -662,6 +707,6 @@ freeze-disabled artifacts. Normal monitors require fallback y/minimum10000,
 with original trace/diagnostic/resource assertions. The preblocked-sysworkq
 arming fixture retains its real ISR/deadline assertions with a finite 100-ms
 minimum matching its 100-ms channel; the same ELF runs three times.
-No patched core supplies any of these assertions. The separate combined
-ZMK mock sanitizer profile still encounters the selected core's documented
-kscan shift; native/compile results do not establish physical acceptance.
+No patched core supplies any of these assertions. The original upstream mock
+control still encounters the documented kscan shift; owner input-fixture success
+does not repair it or establish physical acceptance.

@@ -19,6 +19,151 @@ spec.loader.exec_module(identity)
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def test_native_fixture_inputs_are_selected_and_unselected_metadata_is_excluded(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for directory in [
+                "src",
+                "include",
+                "proto",
+                "tools",
+                "tests/native-input",
+                "tests/support",
+                "dts",
+            ]:
+                shutil.copytree(ROOT / directory, root / directory)
+            for name in ["Kconfig", "CMakeLists.txt"]:
+                shutil.copyfile(ROOT / name, root / name)
+            for name in ["test", "watchdog"]:
+                shutil.copytree(ROOT / "tests" / name, root / "tests" / name)
+            config = root / ".config"
+            config.write_text(
+                "CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE=y\n"
+                "CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE=y\n"
+            )
+
+            def identity_for(name, selected):
+                output = root / name
+                args = [
+                    "build_identity.py",
+                    "--root",
+                    str(root),
+                    "--config",
+                    str(config),
+                    "--zephyr",
+                    str(root),
+                    "--zmk",
+                    str(root),
+                    "--output",
+                    str(output),
+                ]
+                if selected:
+                    args += ["--native-input-dir", str(root / "tests/test")]
+                with patch("sys.argv", args):
+                    identity.main()
+                return json.loads((output / "watchdog-build-identity.json").read_text())
+
+            selected = identity_for("selected", True)
+            for name in [
+                "tests/native-input/kscan.c",
+                "tests/native-input/word.h",
+                "tests/native-input/CMakeLists.txt",
+                "tests/native-input/sanitizers.cmake",
+                "tests/test/native_sim.keymap",
+                "tests/test/native_sim.conf",
+                "tests/test/extra-cmake-args",
+                "dts/bindings/kscan/amgskobo,watchdog-test-kscan.yaml",
+            ]:
+                self.assertEqual(
+                    selected["inputs"][name],
+                    hashlib.sha256((root / name).read_bytes()).hexdigest(),
+                )
+            self.assertNotIn("tests/watchdog/native_sim.conf", selected["inputs"])
+            config.write_text("")
+            unselected = identity_for("unselected", False)
+            with (root / "tests/native-input/word.h").open("a") as stream:
+                stream.write("\n/* synthetic unselected fixture change */\n")
+            after = identity_for("unselected-after", False)
+            self.assertEqual(
+                unselected["source_config_sha256"], after["source_config_sha256"]
+            )
+            self.assertNotIn("tests/native-input/word.h", unselected["inputs"])
+            self.assertNotIn(
+                "tests/native-input/sanitizers.cmake", unselected["inputs"]
+            )
+            self.assertNotEqual(
+                unselected["configuration_nonce"], after["configuration_nonce"]
+            )
+
+    def test_native_word_header_reconfigures_actual_identity_cmake(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            owner = root / "owner"
+            owner.mkdir()
+            for directory in [
+                "src",
+                "include",
+                "proto",
+                "tools",
+                "tests/native-input",
+                "tests/support",
+                "tests/test",
+                "dts",
+            ]:
+                shutil.copytree(ROOT / directory, owner / directory)
+            for name in ["CMakeLists.txt", "Kconfig"]:
+                shutil.copyfile(ROOT / name, owner / name)
+            # Model Zephyr's existing raw quoted-include dependency. The owner
+            # must not add a second normalized alias to Ninja's phony inputs.
+            (owner / "tests/shared.dtsi").write_text("/* synthetic quoted include */\n")
+            with (owner / "tests/test/native_sim.keymap").open("a") as stream:
+                stream.write('\n#include "../shared.dtsi"\n')
+            (root / "noop.c").write_text("int identity_probe_placeholder;\n")
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(input_identity C)\n"
+                "find_package(Python3 REQUIRED COMPONENTS Interpreter)\n"
+                "set(PYTHON_EXECUTABLE ${Python3_EXECUTABLE})\n"
+                "set(ZEPHYR_BASE ${CMAKE_CURRENT_SOURCE_DIR})\n"
+                "set(APPLICATION_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})\n"
+                "set(CONFIG_ZMK_WATCHDOG ON)\nset(CONFIG_ZMK_WATCHDOG_DIAGNOSTICS ON)\n"
+                "set(CONFIG_BOARD_NATIVE_SIM ON)\nset(CONFIG_ASAN ON)\n"
+                "set(CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE ON)\n"
+                "set(CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE ON)\n"
+                "set(ZMK_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/owner/tests/test)\n"
+                'file(WRITE ${PROJECT_BINARY_DIR}/.config "CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE=y\\nCONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE=y\\n")\n'
+                "set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ZMK_CONFIG}/../shared.dtsi)\n"
+                "function(zephyr_include_directories)\nendfunction()\n"
+                "add_library(app STATIC noop.c)\nadd_library(native_simulator INTERFACE)\nadd_subdirectory(owner)\n"
+                "add_custom_target(identity_probe COMMAND ${CMAKE_COMMAND} -E echo identity_probe)\n"
+            )
+            build = root / "build"
+            result = subprocess.run(
+                ["cmake", "-G", "Ninja", "-S", str(root), "-B", str(build)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = build / "owner/diagnostics/watchdog-build-identity.json"
+            before = json.loads(manifest.read_text())
+            with (owner / "tests/native-input/word.h").open("a") as stream:
+                stream.write("\n/* synthetic selected header change */\n")
+            result = subprocess.run(
+                ["cmake", "--build", str(build), "--target", "identity_probe"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            after = json.loads(manifest.read_text())
+            self.assertNotEqual(
+                before["source_config_sha256"], after["source_config_sha256"]
+            )
+            self.assertNotEqual(
+                before["inputs"]["tests/native-input/word.h"],
+                after["inputs"]["tests/native-input/word.h"],
+            )
+
     def test_only_selected_test_sources_and_their_shared_header_are_bound(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

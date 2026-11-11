@@ -1,4 +1,10 @@
 zephyr_include_directories(include)
+if(CONFIG_ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE)
+    include(tests/native-input/sanitizers.cmake)
+endif()
+if(CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE)
+    add_subdirectory(tests/native-input)
+endif()
 if(CONFIG_ZMK_WATCHDOG)
     if(CONFIG_ZMK_WATCHDOG_DIAGNOSTICS)
         set(WATCHDOG_ID_DIR ${CMAKE_CURRENT_BINARY_DIR}/diagnostics)
@@ -21,13 +27,27 @@ if(CONFIG_ZMK_WATCHDOG)
             list(APPEND WATCHDOG_ID_INPUTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/init_result.h)
         endif()
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${WATCHDOG_ID_INPUTS})
+        set(WATCHDOG_NATIVE_INPUT_ARGS)
+        if(CONFIG_ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE)
+            list(APPEND WATCHDOG_NATIVE_INPUT_ARGS --native-input-dir ${ZMK_CONFIG})
+        endif()
         execute_process(COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/build_identity.py
             --root ${CMAKE_CURRENT_SOURCE_DIR} --config ${PROJECT_BINARY_DIR}/.config
             --zephyr ${ZEPHYR_BASE} --zmk ${APPLICATION_SOURCE_DIR}/..
-            --output ${WATCHDOG_ID_DIR} RESULT_VARIABLE WATCHDOG_ID_RESULT)
+            --output ${WATCHDOG_ID_DIR} ${WATCHDOG_NATIVE_INPUT_ARGS} RESULT_VARIABLE WATCHDOG_ID_RESULT)
         if(NOT WATCHDOG_ID_RESULT EQUAL 0)
             message(FATAL_ERROR "Failed to generate watchdog build identity")
         endif()
+        file(STRINGS ${WATCHDOG_ID_DIR}/watchdog-test-inputs.txt WATCHDOG_SELECTED_TEST_INPUTS)
+        foreach(WATCHDOG_TEST_INPUT IN LISTS WATCHDOG_SELECTED_TEST_INPUTS)
+            # Zephyr already tracks keymaps, quoted DTS includes and conf files.
+            # Adding their normalized paths can duplicate Zephyr's ../ aliases
+            # in Ninja's phony configure inputs. Keep hashing them in identity.
+            if(NOT WATCHDOG_TEST_INPUT MATCHES "\\.(keymap|dtsi|conf)$")
+                set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${WATCHDOG_TEST_INPUT})
+            endif()
+        endforeach()
         target_include_directories(app PRIVATE ${WATCHDOG_ID_DIR})
         target_sources(app PRIVATE src/watchdog_diagnostics.c)
         # The boot report only writes log records.

@@ -1,3 +1,19 @@
+config ZMK_WATCHDOG_NATIVE_INPUT_FIXTURE
+    bool "Watchdog owner native input fixture"
+    depends on BOARD_NATIVE_SIM && KSCAN && DT_HAS_AMGSKOBO_WATCHDOG_TEST_KSCAN_ENABLED
+    depends on ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE
+    help
+      Synthetic input source for this owner's native tests only. Uses public
+      Kscan callbacks and cannot be enabled on production boards.
+
+config ZMK_WATCHDOG_NATIVE_SANITIZER_FIXTURE
+    bool "Watchdog owner native sanitizer link fixture"
+    depends on BOARD_NATIVE_SIM && ASAN
+    help
+      Select the strict sanitizer runtime at native_sim's final host link for
+      the owner's native scenarios and original-core expected-failure controls.
+      This test profile cannot be enabled on production boards.
+
 config ZMK_WATCHDOG
     bool "Enable firmware watchdog incident logging"
     select SETTINGS
