@@ -329,6 +329,39 @@ static-memory check. Parser controls reject missing owner/region data,
 duplicates and out-of-region sections. This measures linked static storage,
 not runtime heap or stack high-water use.
 
+### Capture, notification and append storage
+
+The production-shaped central memory variant also retains `-fstack-usage`
+output. `tests/static_memory.py` requires the actual compiled handler,
+capture, fatal, freeze and store sources. Its sized linked symbols bound the
+local incident notification to 384 bytes and the shared fault record to
+336 bytes. Its actual ARM store object must report one static append frame
+of at most 128 bytes. Missing/duplicate storage, non-RAM symbols, missing
+frames and dynamic frames fail the resource checks. The original layout's
+1492-byte incident notification, two 336-byte fault records and 448-byte
+append frame are separate named resource rejections, not runtime mutants.
+No heap or caller-stack record replaces that static storage. The history
+index and shared I/O buffer remain 468 bytes for sixteen complete records.
+
+The existing secured and unsecured Studio fixtures now retain all 80
+diagnostic bytes, all 192 common-context bytes and six fatal words in an
+IncidentRecorded notification. Subsequent freeze and reset notifications
+check bounded names, six ordered trace addresses and clearing of absent
+extensions. Their payloads must match the generated complete Notification's
+wire envelope byte for byte. Existing lock-before-encode and lock-after-sizing
+assertions remain. The preblocked arming fixture additionally runs the real
+fatal handler during minimal freeze publication, checks nested guard ownership,
+then records an independent fatal after the returning test reboot releases
+the guard. Its unchanged binary runs three times and retains the original
+arming marker plus the new ownership marker.
+
+The complete store and real-kernel concurrency fixtures still require
+append/read/delete/load errors and callback reads outside the writer mutex.
+Initial settings-load callbacks retain their independent temporary record;
+sharing it with a writer would cross that lock boundary. These checks and
+compiler frame sizes do not establish physical stack high-water, NVS timing,
+transport delivery, retention or fault recovery.
+
 ### Peripheral diagnostic stack boundary
 
 Refactoring keeps the independent existing common-capture, 192-byte wire,

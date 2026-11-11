@@ -222,6 +222,9 @@ bool zmk_watchdog_pending_had_incident_this_boot(void);
  * immediately instead of overwriting the outer capture. end() is reached only
  * when a test reboot hook returns. */
 bool zmk_watchdog_capture_begin(void);
+/* Acquire that guard and return the common fatal/freeze record, or NULL for a
+ * nested capture. Its storage remains owned until reboot or capture_end(). */
+struct zmk_watchdog_incident_record *zmk_watchdog_capture_begin_record(void);
 void zmk_watchdog_capture_end(void);
 
 /* sys_reboot(SYS_REBOOT_WARM), or the test override. Production code reboots

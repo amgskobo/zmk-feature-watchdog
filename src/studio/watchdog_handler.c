@@ -56,16 +56,20 @@ static bool notifications_allowed(void) {
            zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
 }
 
+static bool notification_authorized(bool *decided, bool *allowed) {
+    /* The first pass runs after the transport wait. Failing a later pass would
+     * leave the Studio frame unterminated, so the decision is kept. */
+    if (!*decided) {
+        *allowed = notifications_allowed();
+        *decided = true;
+    }
+    return *allowed;
+}
+
 static bool encode_notification_payload(pb_ostream_t *stream, const pb_field_t *field,
                                         void *const *arg) {
     struct watchdog_studio_notification *notification = *arg;
-    /* The first pass runs after the transport wait. Failing a later pass would
-     * leave the Studio frame unterminated, so the decision is kept. */
-    if (!notification->decided) {
-        notification->allowed = notifications_allowed();
-        notification->decided = true;
-    }
-    if (!notification->allowed) {
+    if (!notification_authorized(&notification->decided, &notification->allowed)) {
         return true; /* suppress the content, not the completion of the frame */
     }
     return zmk_rpc_custom_subsystem_encode_response_payload(
@@ -92,7 +96,7 @@ static int subsystem_index(void) {
     return -ENOENT;
 }
 
-int watchdog_studio_notify(struct watchdog_studio_notification *notification) {
+static int notify(pb_callback_t encode_payload) {
     if (!notifications_allowed()) {
         return -EACCES;
     }
@@ -101,35 +105,67 @@ int watchdog_studio_notify(struct watchdog_studio_notification *notification) {
         return index;
     }
 
-    notification->decided = false;
     return raise_zmk_studio_custom_notification((struct zmk_studio_custom_notification){
         .subsystem_index = (uint8_t)index,
-        .encode_payload =
-            {
-                .funcs.encode = encode_notification_payload,
-                .arg = notification,
-            },
+        .encode_payload = encode_payload,
     });
+}
+
+int watchdog_studio_notify(struct watchdog_studio_notification *notification) {
+    notification->decided = false;
+    return notify(
+        (pb_callback_t){.funcs.encode = encode_notification_payload, .arg = notification});
 }
 
 /* IncidentRecorded: every persisted incident, including the boot-time
  * reset-cause audit and the pending conversion after a freeze/fatal reboot,
  * so the client sees new incidents without polling. */
 static K_MUTEX_DEFINE(incident_notification_lock);
-static struct watchdog_studio_notification incident_notification;
+/* Only this one-incident branch is needed here. The full Notification oneof
+ * also reserves a peripheral's four-incident page, owned independently by the
+ * relay worker. Keep this smaller body alive through synchronous encoding. */
+static struct {
+    cormoran_watchdog_IncidentRecordedNotification payload;
+    bool decided;
+    bool allowed;
+} incident_notification;
+
+static bool encode_incident_notification_payload(pb_ostream_t *stream, const pb_field_t *field,
+                                                 void *const *arg) {
+    ARG_UNUSED(arg);
+    if (!notification_authorized(&incident_notification.decided, &incident_notification.allowed)) {
+        return true;
+    }
+    /* Emit the unchanged Notification.incident_recorded envelope without its
+     * unrelated full-page union storage. nanopb handles the body and both
+     * length delimiters; sizing and output use the same mutex-owned bytes. */
+    pb_ostream_t sizing = PB_OSTREAM_SIZING;
+    if (!pb_encode_tag(&sizing, PB_WT_STRING,
+                       cormoran_watchdog_Notification_incident_recorded_tag) ||
+        !pb_encode_submessage(&sizing, cormoran_watchdog_IncidentRecordedNotification_fields,
+                              &incident_notification.payload)) {
+        return false;
+    }
+    return pb_encode_tag_for_field(stream, field) &&
+           pb_encode_varint(stream, sizing.bytes_written) &&
+           pb_encode_tag(stream, PB_WT_STRING,
+                         cormoran_watchdog_Notification_incident_recorded_tag) &&
+           pb_encode_submessage(stream, cormoran_watchdog_IncidentRecordedNotification_fields,
+                                &incident_notification.payload);
+}
 
 static void on_incident_appended(uint16_t id, const struct zmk_watchdog_incident_record *rec) {
     k_mutex_lock(&incident_notification_lock, K_FOREVER);
 
-    cormoran_watchdog_Notification *notification = &incident_notification.payload;
-    *notification = (cormoran_watchdog_Notification)cormoran_watchdog_Notification_init_zero;
-    notification->which_notification_type = cormoran_watchdog_Notification_incident_recorded_tag;
-    notification->notification_type.incident_recorded.has_incident = true;
+    cormoran_watchdog_IncidentRecordedNotification *notification = &incident_notification.payload;
+    *notification = (cormoran_watchdog_IncidentRecordedNotification)
+        cormoran_watchdog_IncidentRecordedNotification_init_zero;
+    notification->has_incident = true;
     /* Source 0: the callback fires only for this half's own store. */
-    watchdog_incident_record_to_proto(id, 0, rec,
-                                      &notification->notification_type.incident_recorded.incident);
+    watchdog_incident_record_to_proto(id, 0, rec, &notification->incident);
 
-    int ret = watchdog_studio_notify(&incident_notification);
+    incident_notification.decided = false;
+    int ret = notify((pb_callback_t){.funcs.encode = encode_incident_notification_payload});
     if (ret < 0 && ret != -EACCES) {
         LOG_WRN("Failed to raise watchdog IncidentRecorded notification: %d", ret);
     }

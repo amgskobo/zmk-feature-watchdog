@@ -18,8 +18,6 @@
 #include <cmsis_core.h>
 #endif
 
-static struct zmk_watchdog_incident_record fatal_record;
-
 /* Override Zephyr's weak fatal handler. Another selected strong definition
  * conflicts at link time: inspect the final ELF rather than assuming selection.
  * No logging, Flash or module lock is used in capture. Upstream fault entry,
@@ -97,22 +95,23 @@ void watchdog_fatal_build_record(struct zmk_watchdog_incident_record *rec, unsig
 }
 
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf) {
-    if (!zmk_watchdog_capture_begin()) {
+    struct zmk_watchdog_incident_record *rec = zmk_watchdog_capture_begin_record();
+    if (!rec) {
         zmk_watchdog_reboot();
         return;
     }
     /* Preserve a reason-only record before optional clock/name/ESF reads.
      * A fault in that enrichment path must not recursively build another trace. */
-    memset(&fatal_record, 0, sizeof(fatal_record));
-    fatal_record.type = ZMK_WATCHDOG_INCIDENT_FATAL;
-    fatal_record.flags = ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
-    fatal_record.detail.fatal.reason = reason;
-    fatal_record.detail.fatal.thread_name[0] = '?';
-    watchdog_context_minimal(&fatal_record);
-    zmk_watchdog_pending_set(&fatal_record);
-    watchdog_fatal_build_record(&fatal_record, reason, esf);
+    memset(rec, 0, sizeof(*rec));
+    rec->type = ZMK_WATCHDOG_INCIDENT_FATAL;
+    rec->flags = ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
+    rec->detail.fatal.reason = reason;
+    rec->detail.fatal.thread_name[0] = '?';
+    watchdog_context_minimal(rec);
+    zmk_watchdog_pending_set(rec);
+    watchdog_fatal_build_record(rec, reason, esf);
 
-    zmk_watchdog_pending_set(&fatal_record);
+    zmk_watchdog_pending_set(rec);
     zmk_watchdog_reboot();
     zmk_watchdog_capture_end(); /* Returning test hook only. */
 

@@ -61,8 +61,10 @@ static K_MUTEX_DEFINE(watchdog_store_lock);
  * No settings I/O may run with watchdog_store_lock held. */
 static K_MUTEX_DEFINE(watchdog_store_write_lock);
 static struct watchdog_store_slot slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
-/* One bounded read buffer, owned by watchdog_store_write_lock. History stays
- * in settings; do not put another full record on the peripheral worker stack. */
+/* One bounded I/O buffer, owned by watchdog_store_write_lock. Append also
+ * uses it while holding that mutex; settings-load callbacks need their own
+ * temporary record because they cannot take this mutex. History stays in
+ * settings; do not put another full record on the peripheral worker stack. */
 static struct watchdog_store_slot_blob read_blob;
 static struct watchdog_store_meta meta = {.next_boot_ordinal = 1, .next_id = 1};
 static uint32_t dropped_since_boot;
@@ -210,10 +212,11 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
     rec->version = ZMK_WATCHDOG_RECORD_VERSION;
     rec->boot_ordinal = meta.next_boot_ordinal;
 
-    struct watchdog_store_slot_blob blob = {
-        .id = (uint16_t)id,
-        .rec = *rec,
-    };
+    /* An aggregate initializer materializes a full blob on the ARM stack at
+     * -Os. Copy directly into the mutex-owned I/O storage instead. */
+    memcpy(&read_blob.rec, rec, sizeof(read_blob.rec));
+    read_blob.id = (uint16_t)id;
+    read_blob._reserved = 0;
 
     struct watchdog_store_meta new_meta = {
         .next_boot_ordinal = meta.next_boot_ordinal + 1,
@@ -233,7 +236,7 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
      * bookkeeping. A missing/stale cursor cannot reuse a retained ID:
      * allocation always checks the loaded slots. This is not a transaction;
      * settings commit also reconciles a stale ordinal against retained records. */
-    ret = settings_save_one(name, &blob, sizeof(blob));
+    ret = settings_save_one(name, &read_blob, sizeof(read_blob));
     if (ret < 0) {
         k_mutex_unlock(&watchdog_store_write_lock);
         LOG_ERR("Failed to persist watchdog incident: %d", ret);
@@ -249,17 +252,17 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
 
     k_mutex_lock(&watchdog_store_lock, K_FOREVER);
     meta = new_meta;
-    slots[slot] = (struct watchdog_store_slot){.boot_ordinal = blob.rec.boot_ordinal,
-                                               .id = blob.id,
-                                               .version = blob.rec.version,
+    slots[slot] = (struct watchdog_store_slot){.boot_ordinal = read_blob.rec.boot_ordinal,
+                                               .id = read_blob.id,
+                                               .version = read_blob.rec.version,
                                                .used = true};
     zmk_watchdog_store_appended_cb_t cb = appended_cb;
 
     k_mutex_unlock(&watchdog_store_lock);
     k_mutex_unlock(&watchdog_store_write_lock);
 
-    LOG_INF("Watchdog incident stored: id=%u slot=%d type=%u ordinal=%u", blob.id, slot, rec->type,
-            rec->boot_ordinal);
+    LOG_INF("Watchdog incident stored: id=%u slot=%d type=%u ordinal=%u", (uint16_t)id, slot,
+            rec->type, rec->boot_ordinal);
 #if defined(CONFIG_ZMK_WATCHDOG_OVERWRITE_OLDEST)
     if (replaced_id >= 0) {
         LOG_WRN("Watchdog store full (cap=%d); replaced the oldest incident id=%d ordinal=%u",
@@ -268,7 +271,7 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
 #endif
 
     if (cb) {
-        cb(blob.id, rec);
+        cb((uint16_t)id, rec);
     }
 
     return 0;

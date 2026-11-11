@@ -25,9 +25,6 @@ LOG_MODULE_REGISTER(zmk_watchdog_fork_watchdog_freeze, CONFIG_ZMK_WATCHDOG_FORK_
 /* Each queue is fed twice per timeout. */
 #define WATCHDOG_FREEZE_FEED_MS (CONFIG_ZMK_WATCHDOG_FREEZE_TIMEOUT_MS / 2)
 
-/* The fault may already have exhausted the interrupted thread/ISR stack. */
-static struct zmk_watchdog_incident_record freeze_record;
-
 /* One task_wdt channel per monitored work queue, fed by delayable work on
  * that same queue. If the queue is blocked longer than the timeout, the feed
  * never runs and the channel fires. */
@@ -62,26 +59,26 @@ static struct watchdog_freeze_monitor watchdog_freeze_monitors[] = {
 static void watchdog_freeze_channel_fired(int channel_id, void *user_data) {
     struct watchdog_freeze_monitor *mon = user_data;
 
-    if (!zmk_watchdog_capture_begin()) {
+    struct zmk_watchdog_incident_record *rec = zmk_watchdog_capture_begin_record();
+    if (!rec) {
         zmk_watchdog_reboot();
         return;
     }
-    memset(&freeze_record, 0, sizeof(freeze_record));
-    freeze_record.type = ZMK_WATCHDOG_INCIDENT_FREEZE;
-    freeze_record.flags = ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
-    freeze_record.detail.freeze.trace_flags = ZMK_WATCHDOG_TRACE_PARTIAL;
-    freeze_record.detail.freeze.channel_id = (uint8_t)channel_id;
-    strncpy(freeze_record.detail.freeze.queue_name, mon->name,
-            sizeof(freeze_record.detail.freeze.queue_name) - 1);
+    memset(rec, 0, sizeof(*rec));
+    rec->type = ZMK_WATCHDOG_INCIDENT_FREEZE;
+    rec->flags = ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
+    rec->detail.freeze.trace_flags = ZMK_WATCHDOG_TRACE_PARTIAL;
+    rec->detail.freeze.channel_id = (uint8_t)channel_id;
+    strncpy(rec->detail.freeze.queue_name, mon->name, sizeof(rec->detail.freeze.queue_name) - 1);
     /* Commit a minimal explanation before optional clock/stack capture. */
-    watchdog_context_minimal(&freeze_record);
-    zmk_watchdog_pending_set(&freeze_record);
-    freeze_record.uptime_s = k_uptime_get_32() / 1000U;
-    watchdog_freeze_capture_thread(&mon->get_queue()->thread, &freeze_record.detail.freeze);
-    watchdog_context_capture(&freeze_record, NULL, &mon->get_queue()->thread);
-    freeze_record.flags &= ~ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
+    watchdog_context_minimal(rec);
+    zmk_watchdog_pending_set(rec);
+    rec->uptime_s = k_uptime_get_32() / 1000U;
+    watchdog_freeze_capture_thread(&mon->get_queue()->thread, &rec->detail.freeze);
+    watchdog_context_capture(rec, NULL, &mon->get_queue()->thread);
+    rec->flags &= ~ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
 
-    zmk_watchdog_pending_set(&freeze_record);
+    zmk_watchdog_pending_set(rec);
     zmk_watchdog_reboot();
     zmk_watchdog_capture_end(); /* Only reached by a returning test reboot hook. */
 }

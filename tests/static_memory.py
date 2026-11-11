@@ -9,6 +9,54 @@ import subprocess
 
 
 WATCHDOG_CENTRAL_STATIC_RAM_MAX = 5760
+WATCHDOG_INCIDENT_NOTIFICATION_RAM_MAX = 384
+WATCHDOG_CAPTURE_RECORD_RAM_MAX = 336
+WATCHDOG_APPEND_STACK_MAX = 128
+
+
+def capture_notification_usage(symbols):
+    """Count the real linked records, including the original duplicate layout."""
+    selected = {}
+    names = {"incident_notification", "capture_record", "fatal_record", "freeze_record"}
+    for line in symbols.splitlines():
+        fields = line.split()
+        if not fields or fields[-1] not in names:
+            continue
+        if (
+            len(fields) != 4
+            or fields[2] not in {"b", "B", "d", "D"}
+            or not re.fullmatch(r"[0-9a-fA-F]+", fields[0])
+            or not re.fullmatch(r"[0-9a-fA-F]+", fields[1])
+            or fields[-1] in selected
+        ):
+            raise AssertionError(
+                "capture/notification RAM: invalid or duplicate symbol"
+            )
+        selected[fields[-1]] = int(fields[1], 16)
+    if not selected.get("incident_notification") or not any(
+        selected.get(name) for name in names - {"incident_notification"}
+    ):
+        raise AssertionError("capture/notification RAM: missing linked storage")
+    return {
+        "incident_notification_bytes": selected["incident_notification"],
+        "capture_record_bytes": sum(
+            size for name, size in selected.items() if name != "incident_notification"
+        ),
+        "symbols": selected,
+    }
+
+
+def append_stack_usage(text):
+    rows = [
+        line.split("\t")
+        for line in text.splitlines()
+        if line.split("\t")[0].endswith(":zmk_watchdog_store_append")
+    ]
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][2] != "static":
+        raise AssertionError("append stack: missing, duplicate or unbounded frame")
+    if not rows[0][1].isdigit() or int(rows[0][1]) <= 0:
+        raise AssertionError("append stack: invalid frame size")
+    return int(rows[0][1])
 
 
 def central_static_usage(text):
@@ -84,7 +132,7 @@ def central_artifact_usage(artifact_dir, owner):
     if not nm or not Path(nm.group(1)).is_absolute():
         raise AssertionError("central static RAM: missing selected toolchain nm")
     symbols = subprocess.run(
-        [nm.group(1), "--defined-only", str(artifact_dir / "zmk.elf")],
+        [nm.group(1), "-S", "--defined-only", str(artifact_dir / "zmk.elf")],
         capture_output=True,
         text=True,
         check=True,
@@ -112,6 +160,27 @@ def central_artifact_usage(artifact_dir, owner):
     usage["elf_sha256"] = hashlib.sha256(
         (artifact_dir / "zmk.elf").read_bytes()
     ).hexdigest()
+    usage["capture_notification"] = capture_notification_usage(symbols.stdout)
+    for name in [
+        "watchdog_handler.c",
+        "watchdog_capture.c",
+        "watchdog_fatal.c",
+        "watchdog_freeze.c",
+        "watchdog_store.c",
+    ]:
+        source = (
+            owner / "src" / ("studio" if name == "watchdog_handler.c" else "") / name
+        )
+        compiled = [row for row in commands if Path(row["file"]).resolve() == source]
+        if len(compiled) != 1:
+            raise AssertionError(
+                "capture/notification RAM: missing actual owner " + name
+            )
+    frames = list(artifact_dir.parent.rglob("watchdog_store.c.su"))
+    if len(frames) != 1:
+        raise AssertionError("append stack: missing actual owner stack-usage file")
+    usage["append_stack_bytes"] = append_stack_usage(frames[0].read_text())
+    usage["append_stack_file"] = str(frames[0])
     (artifact_dir.parent / "watchdog-central-static-ram.json").write_text(
         json.dumps(usage, indent=2) + "\n"
     )

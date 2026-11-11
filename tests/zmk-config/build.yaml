@@ -90,7 +90,7 @@ include:
   - artifact: module_watchdog_split_central_memory
     board: xiao_ble//zmk
     shield: tester_xiao
-    cmake-args: -DCONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST=n
+    cmake-args: -DCONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST=n -DEXTRA_CFLAGS=-fstack-usage
     snippets:
       - studio-rpc-usb-uart
       - watchdog-split-rpc-relay

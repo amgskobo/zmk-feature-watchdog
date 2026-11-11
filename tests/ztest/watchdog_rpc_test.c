@@ -317,6 +317,17 @@ static int notification_probe_listener(const zmk_event_t *eh) {
         notification_probe_encoded =
             notification_probe_frame_valid && capture.size > 0 &&
             pb_decode(&input, cormoran_watchdog_Notification_fields, &notification_probe_decoded);
+        if (notification_probe_encoded) {
+            /* The generated complete Notification is an independent wire
+             * envelope oracle for the compact production incident encoder. */
+            static uint8_t generated[cormoran_watchdog_Notification_size];
+            pb_ostream_t reference = pb_ostream_from_buffer(generated, sizeof(generated));
+            notification_probe_frame_valid =
+                pb_encode(&reference, cormoran_watchdog_Notification_fields,
+                          &notification_probe_decoded) &&
+                reference.bytes_written == capture.size &&
+                memcmp(generated, capture.buf, capture.size) == 0;
+        }
     }
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -330,6 +341,20 @@ static int test_notification_authorization(void) {
     record.type = ZMK_WATCHDOG_INCIDENT_FATAL;
     record.uptime_s = 42;
     record.detail.fatal.pc = 0x1020;
+    record.detail.fatal.reason = 0x81234567U;
+    record.detail.fatal.lr = 0xfedcba98U;
+    record.flags = ZMK_WATCHDOG_FATAL_CONTEXT_VALID | ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID |
+                   ZMK_WATCHDOG_CAPTURE_INCOMPLETE;
+    memset(record.detail.fatal.thread_name, 'F', sizeof(record.detail.fatal.thread_name));
+    for (unsigned i = 0; i < 6; ++i) {
+        record.detail.fatal.context[i] = 0x80000000U + i;
+    }
+    for (unsigned i = 0; i < sizeof(record.diagnostics); ++i) {
+        record.diagnostics[i] = (uint8_t)(i + 1U);
+    }
+    for (unsigned i = 0; i < sizeof(record.capture_context); ++i) {
+        record.capture_context[i] = (uint8_t)(i + 1U);
+    }
     notification_probe_active = true;
     zmk_studio_core_lock();
     notification_probe_events = 0;
@@ -340,7 +365,6 @@ static int test_notification_authorization(void) {
         notification_probe_encoded != unsecured || notification_probe_frame_valid != unsecured) {
         return -EINVAL;
     }
-
     zmk_studio_core_unlock();
     notification_probe_events = 0;
     notification_probe_encoded = false;
@@ -353,6 +377,22 @@ static int test_notification_authorization(void) {
         notification_probe_decoded.notification_type.incident_recorded.incident.detail.fatal.pc !=
             0x1020) {
         return -EINVAL;
+    }
+
+    const cormoran_watchdog_Incident *incident =
+        &notification_probe_decoded.notification_type.incident_recorded.incident;
+    if (incident->detail.fatal.reason != 0x81234567U || incident->detail.fatal.lr != 0xfedcba98U ||
+        incident->detail.fatal.context.size != 24 || incident->diagnostics.size != 80 ||
+        incident->capture_context.size != 192 || incident->capture_flags != 6 ||
+        memcmp(incident->diagnostics.bytes, record.diagnostics, 80) ||
+        memcmp(incident->capture_context.bytes, record.capture_context, 192) ||
+        strlen(incident->detail.fatal.thread_name) != 15) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < 6; ++i) {
+        if (sys_get_le32(incident->detail.fatal.context.bytes + 4 * i) != 0x80000000U + i) {
+            return -EINVAL;
+        }
     }
 
     notification_probe_lock_before_encode = true;
@@ -377,9 +417,46 @@ static int test_notification_authorization(void) {
     if (notification_probe_events != 1) {
         return -EINVAL;
     }
+    record = (struct zmk_watchdog_incident_record){0};
+    record.type = ZMK_WATCHDOG_INCIDENT_FREEZE;
+    record.detail.freeze.channel_id = 7;
+    record.detail.freeze.trace_flags = ZMK_WATCHDOG_TRACE_PARTIAL;
+    record.detail.freeze.trace_count = 6;
+    record.detail.freeze.stack_pointer = 0x20001000U;
+    record.detail.freeze.wait_queue = 0x20002000U;
+    memset(record.detail.freeze.queue_name, 'Q', sizeof(record.detail.freeze.queue_name));
+    for (unsigned i = 0; i < 6; ++i) {
+        record.detail.freeze.addresses[i] = 0x12345601U + 2U * i;
+    }
+    if (zmk_watchdog_store_append(&record) != 0 || !notification_probe_frame_valid ||
+        !notification_probe_encoded || incident->type != cormoran_watchdog_IncidentType_FREEZE ||
+        incident->detail.freeze.channel_id != 7 || incident->detail.freeze.trace.size != 36 ||
+        incident->detail.freeze.trace.bytes[3] != 6 || incident->diagnostics.size != 0 ||
+        incident->capture_context.size != 0 || incident->capture_flags != 0 ||
+        strlen(incident->detail.freeze.queue_name) != 15 ||
+        sys_get_le32(incident->detail.freeze.trace.bytes + 8) != 0x20001000U) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < 6; ++i) {
+        if (sys_get_le32(incident->detail.freeze.trace.bytes + 12 + 4 * i) !=
+            0x12345601U + 2U * i) {
+            return -EINVAL;
+        }
+    }
+    record = (struct zmk_watchdog_incident_record){0};
+    record.type = ZMK_WATCHDOG_INCIDENT_RESET_CAUSE;
+    record.detail.reset.cause_bits = 0x81234567U;
+    if (zmk_watchdog_store_append(&record) != 0 || !notification_probe_frame_valid ||
+        !notification_probe_encoded ||
+        incident->type != cormoran_watchdog_IncidentType_RESET_CAUSE ||
+        incident->detail.reset.cause_bits != 0x81234567U || incident->diagnostics.size != 0 ||
+        incident->capture_context.size != 0 || zmk_watchdog_store_count() != 6) {
+        return -EINVAL;
+    }
     notification_probe_active = false;
     zmk_studio_core_lock();
     LOG_INF("PASS: watchdog_notification_authorization unsecured=%d", unsecured);
+    LOG_INF("PASS: watchdog_notification_compact_wire kinds=3 diagnostics=80 context=192");
     return zmk_watchdog_store_delete_all();
 }
 

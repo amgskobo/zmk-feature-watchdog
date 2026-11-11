@@ -19,7 +19,13 @@ from test_build_budget import BuildBudgetContract as BuildBudgetContract
 from test_native_input import NativeInputContract as NativeInputContract
 from decoder.test_build_identity import BuildIdentityTests as BuildIdentityTests
 from test_static_memory import CentralStaticMemory as CentralStaticMemory
-from static_memory import central_artifact_usage, WATCHDOG_CENTRAL_STATIC_RAM_MAX
+from static_memory import (
+    central_artifact_usage,
+    WATCHDOG_CENTRAL_STATIC_RAM_MAX,
+    WATCHDOG_INCIDENT_NOTIFICATION_RAM_MAX,
+    WATCHDOG_CAPTURE_RECORD_RAM_MAX,
+    WATCHDOG_APPEND_STACK_MAX,
+)
 
 THIS_DIR = Path(__file__).resolve().parent.parent
 TEST_BUILD_DIR_NAME = "tests-zmk-feature-watchdog"
@@ -113,6 +119,10 @@ class WestCommandsTests(unittest.TestCase):
                 "watchdog_rpc_inject_freeze_recorded",
             ]:
                 self.assertIn("PASS: " + marker, studio_log)
+            self.assertIn(
+                "PASS: watchdog_notification_compact_wire kinds=3 diagnostics=80 context=192",
+                studio_log,
+            )
 
     @unittest.skipUnless(platform.system() == "Linux", "native controls require Linux")
     def test_original_mock_expected_rejections(self):
@@ -238,6 +248,12 @@ class WestCommandsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             result.stdout.count("PASS watchdog arms despite preblocked sysworkq"), 3
+        )
+        self.assertEqual(
+            result.stdout.count(
+                "PASS watchdog capture ownership nested=2 sequential=2 commits=4"
+            ),
+            3,
         )
 
     @unittest.skipUnless(
@@ -522,6 +538,21 @@ class WestCommandsTests(unittest.TestCase):
                     usage["static_ram_bytes"],
                     WATCHDOG_CENTRAL_STATIC_RAM_MAX,
                     "Watchdog central static RAM budget exceeded",
+                )
+                self.assertLessEqual(
+                    usage["capture_notification"]["incident_notification_bytes"],
+                    WATCHDOG_INCIDENT_NOTIFICATION_RAM_MAX,
+                    "Watchdog incident notification RAM budget exceeded",
+                )
+                self.assertLessEqual(
+                    usage["capture_notification"]["capture_record_bytes"],
+                    WATCHDOG_CAPTURE_RECORD_RAM_MAX,
+                    "Watchdog shared capture RAM budget exceeded",
+                )
+                self.assertLessEqual(
+                    usage["append_stack_bytes"],
+                    WATCHDOG_APPEND_STACK_MAX,
+                    "Watchdog append stack frame budget exceeded",
                 )
             config_path = artifact_dir / ".config"
             device_tree_path = (

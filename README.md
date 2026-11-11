@@ -152,6 +152,17 @@ metadata, mutexes, pending capture and RPC/relay storage are separate costs.
 No heap allocation, capacity reduction, new periodic read or settings migration
 is introduced; v1-v4 records keep their bytes, IDs and ordering.
 
+Append reuses that same 340-byte buffer while it owns the store writer mutex;
+it does not reserve another slot blob on the caller's stack. The initial
+settings-load callback retains a separate temporary record because it cannot
+take that mutex. Fatal and freeze capture share one 336-byte record behind the
+existing non-blocking capture guard. A nested detector goes directly to reboot
+without touching the outer record. Local IncidentRecorded notifications retain
+only their single-incident body; the relay still owns its independent complete
+page response and accumulator. Encoding preserves the existing wire envelope,
+all extensions and the authorization decision across sizing/output passes.
+These fixed-storage changes add no heap, worker, timer or Flash operation.
+
 Record retrieval is now a blocking settings read serialized with append/delete.
 The RAM-index mutex is never held across settings I/O, so status and count stay
 available during a slow read or write. All getters leave outputs unchanged on
