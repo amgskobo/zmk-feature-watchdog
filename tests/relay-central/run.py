@@ -78,6 +78,11 @@ def main():
                 result.returncode == 0
                 and "RESULT: PASS failures=0" in text
                 and "FAIL line=" not in text
+                and (
+                    count != 1
+                    or "CENTRAL_NOTIFICATION PASS groups=6 notifications=5 queued=20 capacity=21"
+                    in text
+                )
             )
             rows.append(
                 dict(

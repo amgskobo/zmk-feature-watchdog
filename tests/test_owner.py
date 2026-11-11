@@ -18,6 +18,8 @@ from test_store_mutations import StoreMutationSelectors as StoreMutationSelector
 from test_build_budget import BuildBudgetContract as BuildBudgetContract
 from test_native_input import NativeInputContract as NativeInputContract
 from decoder.test_build_identity import BuildIdentityTests as BuildIdentityTests
+from test_static_memory import CentralStaticMemory as CentralStaticMemory
+from static_memory import central_artifact_usage, WATCHDOG_CENTRAL_STATIC_RAM_MAX
 
 THIS_DIR = Path(__file__).resolve().parent.parent
 TEST_BUILD_DIR_NAME = "tests-zmk-feature-watchdog"
@@ -430,6 +432,23 @@ class WestCommandsTests(unittest.TestCase):
                     ],
                     device=[],
                 ),
+                "module_watchdog_split_central_memory": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_ZMK_WATCHDOG=y",
+                        "CONFIG_ZMK_SPLIT=y",
+                        "CONFIG_ZMK_SPLIT_ROLE_CENTRAL=y",
+                        "CONFIG_ZMK_SPLIT_RELAY_EVENT=y",
+                        "CONFIG_ZMK_WATCHDOG_SPLIT_RELAY=y",
+                        "# CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST is not set",
+                        "CONFIG_ZMK_STUDIO=y",
+                        "CONFIG_ZMK_WATCHDOG_STUDIO_RPC=y",
+                        "CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS=16",
+                        "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=64",
+                        "CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN=128",
+                        NotFound("CONFIG_ZMK_WATCHDOG_TEST_INJECTION=y"),
+                    ],
+                    device=[],
+                ),
             }
         )
 
@@ -497,6 +516,13 @@ class WestCommandsTests(unittest.TestCase):
 
         for artifact, entries in artifacts_and_expected_build_params.items():
             artifact_dir = self.BUILD_DIR / artifact / "zephyr"
+            if artifact == "module_watchdog_split_central_memory":
+                usage = central_artifact_usage(artifact_dir, THIS_DIR)
+                self.assertLessEqual(
+                    usage["static_ram_bytes"],
+                    WATCHDOG_CENTRAL_STATIC_RAM_MAX,
+                    "Watchdog central static RAM budget exceeded",
+                )
             config_path = artifact_dir / ".config"
             device_tree_path = (
                 artifact_dir

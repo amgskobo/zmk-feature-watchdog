@@ -114,10 +114,11 @@ void watchdog_relay_dispatch_request(const cormoran_watchdog_Request *req,
 static K_MUTEX_DEFINE(peripheral_response_notification_lock);
 static struct watchdog_studio_notification peripheral_response_notification;
 
-/* Wraps `resp` in PeripheralResponse{source, request_id, response} and
- * notifies it, under the same lock rule as every watchdog notification. */
-static void raise_peripheral_response_notification(uint32_t source, uint32_t request_id,
-                                                   const cormoran_watchdog_Response *resp) {
+/* The serialized relay worker builds directly in the notification's response.
+ * Keep ownership from initialization through every synchronous encoder pass,
+ * including a transport wait; no other full-page scratch response is needed. */
+static cormoran_watchdog_Response *prepare_peripheral_response_notification(uint32_t source,
+                                                                            uint32_t request_id) {
     k_mutex_lock(&peripheral_response_notification_lock, K_FOREVER);
 
     cormoran_watchdog_Notification *notification = &peripheral_response_notification.payload;
@@ -127,11 +128,15 @@ static void raise_peripheral_response_notification(uint32_t source, uint32_t req
     pr->source = source;
     pr->request_id = request_id;
     pr->has_response = true;
-    pr->response = *resp;
+    return &pr->response;
+}
 
-    int ret = watchdog_studio_notify(&peripheral_response_notification);
-    if (ret < 0 && ret != -EACCES) {
-        LOG_WRN("Failed to raise watchdog PeripheralResponse notification: %d", ret);
+static void finish_peripheral_response_notification(bool ready) {
+    if (ready) {
+        int ret = watchdog_studio_notify(&peripheral_response_notification);
+        if (ret < 0 && ret != -EACCES) {
+            LOG_WRN("Failed to raise watchdog PeripheralResponse notification: %d", ret);
+        }
     }
 
     k_mutex_unlock(&peripheral_response_notification_lock);
@@ -141,12 +146,10 @@ static struct watchdog_relay_page chunk_accumulator;
 
 static void handle_incident_chunk(uint32_t source, uint32_t request_id,
                                   const cormoran_watchdog_RelayIncidentChunk *chunk) {
-    /* Only the serialized relay worker calls this; keep the full page off its
-     * stack. */
-    static cormoran_watchdog_Response response;
-    if (watchdog_relay_page_core(&chunk_accumulator, source, request_id, chunk, &response)) {
-        raise_peripheral_response_notification(source, request_id, &response);
-    }
+    cormoran_watchdog_Response *response =
+        prepare_peripheral_response_notification(source, request_id);
+    bool ready = watchdog_relay_page_core(&chunk_accumulator, source, request_id, chunk, response);
+    finish_peripheral_response_notification(ready);
 }
 
 static void handle_diagnostic_chunk(uint32_t source, uint32_t request_id,
@@ -200,30 +203,30 @@ static void watchdog_relay_response_process_work_handler(struct k_work *work) {
                                   &relay_resp.relay_response_type.incident_chunk);
             break;
         case cormoran_watchdog_RelayResponse_response_tag: {
-            static cormoran_watchdog_Response resp;
-            resp = (cormoran_watchdog_Response)cormoran_watchdog_Response_init_zero;
+            cormoran_watchdog_Response *resp =
+                prepare_peripheral_response_notification(source, relay_resp.request_id);
             const cormoran_watchdog_RelayNonListResponse *rnl =
                 &relay_resp.relay_response_type.response;
             switch (rnl->which_relay_non_list_response_type) {
             case cormoran_watchdog_RelayNonListResponse_status_tag:
-                resp.which_response_type = cormoran_watchdog_Response_status_tag;
-                resp.response_type.status = rnl->relay_non_list_response_type.status;
+                resp->which_response_type = cormoran_watchdog_Response_status_tag;
+                resp->response_type.status = rnl->relay_non_list_response_type.status;
                 break;
             case cormoran_watchdog_RelayNonListResponse_delete_result_tag:
-                resp.which_response_type = cormoran_watchdog_Response_delete_result_tag;
-                resp.response_type.delete_result = rnl->relay_non_list_response_type.delete_result;
+                resp->which_response_type = cormoran_watchdog_Response_delete_result_tag;
+                resp->response_type.delete_result = rnl->relay_non_list_response_type.delete_result;
                 break;
             case cormoran_watchdog_RelayNonListResponse_inject_ack_tag:
-                resp.which_response_type = cormoran_watchdog_Response_inject_ack_tag;
-                resp.response_type.inject_ack = rnl->relay_non_list_response_type.inject_ack;
+                resp->which_response_type = cormoran_watchdog_Response_inject_ack_tag;
+                resp->response_type.inject_ack = rnl->relay_non_list_response_type.inject_ack;
                 break;
             case cormoran_watchdog_RelayNonListResponse_error_tag:
             default:
-                resp.which_response_type = cormoran_watchdog_Response_error_tag;
-                resp.response_type.error = rnl->relay_non_list_response_type.error;
+                resp->which_response_type = cormoran_watchdog_Response_error_tag;
+                resp->response_type.error = rnl->relay_non_list_response_type.error;
                 break;
             }
-            raise_peripheral_response_notification(source, relay_resp.request_id, &resp);
+            finish_peripheral_response_notification(true);
             break;
         }
         default:

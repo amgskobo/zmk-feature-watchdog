@@ -287,6 +287,31 @@ central unit; compile failures do not qualify as rejected controls. Real board
 configuration/role selection remains in the full build matrix; this fixture does
 not establish physical split/radio/transport or worst-case stack acceptance.
 
+The single-peer variant also retains an incomplete four-incident page while a
+non-list notification is blocked. All twenty remaining page datagrams must fit
+the unchanged21-entry FIFO, and the notification payload and its mutex remain
+owned through synchronous sizing/output encoding. Exact source/request IDs,
+raw times, all diagnostic/context bytes and ordered status/page delivery are
+required. Access denial, transport error and a subsequent successful reply must
+release ownership without leaking the previous response.
+
+The central worker builds both page and non-list replies in the existing
+notification-owned response, keeping the independent page accumulator. It does
+not allocate another full-page scratch response or move it to a stack/heap.
+`tests/static_memory.py` accounts the actual central input object's linked RAM
+sections, including kernel objects and the FIFO, from the additional
+`module_watchdog_split_central_memory` ARM board map. It selects the production
+relay with `CONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST=n` and requires the actual
+owner C compilation and absence of the boot-scenario symbols. All ten original
+functional/test board variants remain selected. In particular, the original
+central scenario retains its two synthetic response buffers and init work;
+their2960 bytes are real linked test storage and are not subtracted from a map.
+The production variant's selected ABI budget remains5760 bytes; the original
+two-scratch-response production layout uses8704 bytes and must fail the named
+static-memory check. Parser controls reject missing owner/region data,
+duplicates and out-of-region sections. This measures linked static storage,
+not runtime heap or stack high-water use.
+
 ### Peripheral diagnostic stack boundary
 
 Refactoring keeps the independent existing common-capture, 192-byte wire,

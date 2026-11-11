@@ -84,3 +84,14 @@ include:
       - studio-rpc-usb-uart
       - watchdog-split-rpc-relay
       - watchdog-split-central
+
+  # Production-shaped central RAM accounting excludes the boot scenarios above,
+  # while retaining their separate compile/link coverage unchanged.
+  - artifact: module_watchdog_split_central_memory
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_WATCHDOG_SPLIT_RELAY_TEST=n
+    snippets:
+      - studio-rpc-usb-uart
+      - watchdog-split-rpc-relay
+      - watchdog-split-central
