@@ -42,9 +42,12 @@ struct watchdog_store_slot_blob {
 BUILD_ASSERT(sizeof(struct watchdog_store_slot_blob) == 340, "watchdog v4 slot layout changed");
 
 struct watchdog_store_slot {
+    uint32_t boot_ordinal;
+    uint16_t id;
+    uint8_t version;
     bool used;
-    struct watchdog_store_slot_blob blob;
 };
+BUILD_ASSERT(sizeof(struct watchdog_store_slot) == 8, "watchdog RAM index grew");
 
 struct watchdog_store_meta {
     uint32_t next_boot_ordinal;
@@ -53,11 +56,14 @@ struct watchdog_store_meta {
 } __packed;
 
 static K_MUTEX_DEFINE(watchdog_store_lock);
-/* Serialize writers, but never acquire this from a settings callback.
+/* Serialize persisted reads and writers, but never acquire this from a settings callback.
  * settings_load holds Zephyr's settings lock while invoking h_set/h_commit.
  * No settings I/O may run with watchdog_store_lock held. */
 static K_MUTEX_DEFINE(watchdog_store_write_lock);
 static struct watchdog_store_slot slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
+/* One bounded read buffer, owned by watchdog_store_write_lock. History stays
+ * in settings; do not put another full record on the peripheral worker stack. */
+static struct watchdog_store_slot_blob read_blob;
 static struct watchdog_store_meta meta = {.next_boot_ordinal = 1, .next_id = 1};
 static uint32_t dropped_since_boot;
 static zmk_watchdog_store_appended_cb_t appended_cb;
@@ -83,7 +89,7 @@ static int find_free_slot_locked(void) {
 static int find_slot_by_id_locked(uint16_t id) {
     int found = -ENOENT;
     for (size_t i = 0; i < ARRAY_SIZE(slots); i++) {
-        if (slots[i].used && slots[i].blob.id == id) {
+        if (slots[i].used && slots[i].id == id) {
             if (found >= 0) {
                 return -EEXIST;
             }
@@ -147,8 +153,7 @@ static int find_oldest_slot_locked(void) {
         if (!slots[i].used) {
             continue;
         }
-        if (oldest < 0 ||
-            (int32_t)(slots[i].blob.rec.boot_ordinal - slots[oldest].blob.rec.boot_ordinal) < 0) {
+        if (oldest < 0 || (int32_t)(slots[i].boot_ordinal - slots[oldest].boot_ordinal) < 0) {
             oldest = (int)i;
         }
     }
@@ -181,8 +186,8 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
     if (slot < 0 && rec->uptime_s >= min_uptime_s) {
         slot = find_oldest_slot_locked();
         if (slot >= 0) {
-            replaced_id = slots[slot].blob.id;
-            replaced_ordinal = slots[slot].blob.rec.boot_ordinal;
+            replaced_id = slots[slot].id;
+            replaced_ordinal = slots[slot].boot_ordinal;
         }
     }
 #endif
@@ -244,8 +249,10 @@ int zmk_watchdog_store_append(struct zmk_watchdog_incident_record *rec) {
 
     k_mutex_lock(&watchdog_store_lock, K_FOREVER);
     meta = new_meta;
-    slots[slot].used = true;
-    slots[slot].blob = blob;
+    slots[slot] = (struct watchdog_store_slot){.boot_ordinal = blob.rec.boot_ordinal,
+                                               .id = blob.id,
+                                               .version = blob.rec.version,
+                                               .used = true};
     zmk_watchdog_store_appended_cb_t cb = appended_cb;
 
     k_mutex_unlock(&watchdog_store_lock);
@@ -300,8 +307,7 @@ int zmk_watchdog_store_delete(uint16_t id) {
     }
 
     k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-    slots[slot].used = false;
-    memset(&slots[slot].blob, 0, sizeof(slots[slot].blob));
+    memset(&slots[slot], 0, sizeof(slots[slot]));
 
     k_mutex_unlock(&watchdog_store_lock);
     k_mutex_unlock(&watchdog_store_write_lock);
@@ -343,8 +349,7 @@ int zmk_watchdog_store_delete_all(void) {
         }
 
         k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-        slots[i].used = false;
-        memset(&slots[i].blob, 0, sizeof(slots[i].blob));
+        memset(&slots[i], 0, sizeof(slots[i]));
         k_mutex_unlock(&watchdog_store_lock);
     }
 
@@ -354,54 +359,128 @@ int zmk_watchdog_store_delete_all(void) {
     return first_error;
 }
 
-int zmk_watchdog_store_get(uint16_t index, struct zmk_watchdog_incident_record *out) {
-    if (!out) {
+/* Both initial indexing and later reads validate the unchanged v1-v4 layouts. */
+static int decode_slot_blob(size_t len, settings_read_cb read_cb, void *cb_arg,
+                            struct watchdog_store_slot_blob *blob) {
+    if (len != sizeof(*blob) && len != WATCHDOG_STORE_V1_BLOB_SIZE &&
+        len != WATCHDOG_STORE_V2_BLOB_SIZE && len != WATCHDOG_STORE_V3_BLOB_SIZE) {
         return -EINVAL;
     }
-
-    k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-    int slot = find_slot_by_enum_index_locked(index);
-    if (slot < 0) {
-        k_mutex_unlock(&watchdog_store_lock);
-        return -ENOENT;
+    memset(blob, 0, sizeof(*blob));
+    ssize_t read = read_cb(cb_arg, blob, len);
+    if (read < 0) {
+        return (int)read;
     }
-    *out = slots[slot].blob.rec;
-    k_mutex_unlock(&watchdog_store_lock);
+    if ((size_t)read != len) {
+        return -EIO;
+    }
+    if (blob->rec.type > ZMK_WATCHDOG_INCIDENT_RESET_CAUSE ||
+        (len == WATCHDOG_STORE_V1_BLOB_SIZE && blob->rec.version != 1) ||
+        (len == WATCHDOG_STORE_V2_BLOB_SIZE && blob->rec.version != 2) ||
+        (len == WATCHDOG_STORE_V3_BLOB_SIZE && blob->rec.version != 3) ||
+        (len == sizeof(*blob) && blob->rec.version != ZMK_WATCHDOG_RECORD_VERSION)) {
+        return -EINVAL;
+    }
+    if (blob->rec.version == 1 && blob->rec.type == ZMK_WATCHDOG_INCIDENT_FREEZE) {
+        /* Legacy reserved bytes are not diagnostic state or pointers. */
+        blob->rec.detail.freeze.thread_state = 0;
+        blob->rec.detail.freeze.trace_flags = 0;
+        blob->rec.detail.freeze.trace_count = 0;
+        blob->rec.detail.freeze.wait_queue = 0;
+        blob->rec.detail.freeze.stack_pointer = 0;
+        memset(blob->rec.detail.freeze.addresses, 0, sizeof(blob->rec.detail.freeze.addresses));
+    }
+    if (blob->rec.version < 4) {
+        blob->rec.flags &= ~ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID;
+    }
+    if (blob->rec.version < 3) {
+        blob->rec.flags = 0;
+        if (blob->rec.type == ZMK_WATCHDOG_INCIDENT_FATAL) {
+            memset(blob->rec.detail.fatal.context, 0, sizeof(blob->rec.detail.fatal.context));
+        }
+    }
     return 0;
 }
 
-int zmk_watchdog_store_get_by_id(uint16_t id, struct zmk_watchdog_incident_record *out) {
-    if (!out) {
-        return -EINVAL;
+struct watchdog_store_read {
+    bool found;
+    int result;
+};
+
+static int read_slot_setting(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg,
+                             void *param) {
+    struct watchdog_store_read *read = param;
+    if (key && key[0] != '\0') {
+        return 0; /* An unexpected child key is not this exact slot. */
+    }
+    if (read->found) {
+        read->result = -EEXIST;
+    } else {
+        read->found = true;
+        read->result = decode_slot_blob(len, read_cb, cb_arg, &read_blob);
+    }
+    /* This core discards csi_load's return value. Retain every callback error
+     * in our context instead of treating a successful traversal as valid data. */
+    return 0;
+}
+
+static int get_record(uint16_t selector, bool by_id, struct zmk_watchdog_incident_record *out,
+                      uint16_t *id_out) {
+    k_mutex_lock(&watchdog_store_write_lock, K_FOREVER);
+    k_mutex_lock(&watchdog_store_lock, K_FOREVER);
+    int slot = by_id ? find_slot_by_id_locked(selector) : find_slot_by_enum_index_locked(selector);
+    if (slot < 0) {
+        k_mutex_unlock(&watchdog_store_lock);
+        k_mutex_unlock(&watchdog_store_write_lock);
+        return by_id ? slot : -ENOENT;
+    }
+    struct watchdog_store_slot expected = slots[slot];
+    k_mutex_unlock(&watchdog_store_lock);
+
+    char name[SETTINGS_MAX_NAME_LEN];
+    int ret = slot_settings_name((uint16_t)slot, name, sizeof(name));
+    if (ret == 0) {
+        struct watchdog_store_read read = {.result = -EIO};
+        ret = settings_load_subtree_direct(name, read_slot_setting, &read);
+        if (ret == 0) {
+            ret = read.result; /* Missing persisted data is an error, not an empty index. */
+        }
     }
 
     k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-    int slot = find_slot_by_id_locked(id);
-    if (slot < 0) {
-        k_mutex_unlock(&watchdog_store_lock);
-        return slot;
+    if (ret == 0) {
+        const struct watchdog_store_slot *current = &slots[slot];
+        if (!current->used || current->id != expected.id ||
+            current->boot_ordinal != expected.boot_ordinal ||
+            current->version != expected.version) {
+            ret = -EAGAIN; /* A settings reload changed the index during traversal. */
+        } else if (read_blob.id != expected.id ||
+                   read_blob.rec.boot_ordinal != expected.boot_ordinal ||
+                   read_blob.rec.version != expected.version) {
+            ret = -EIO; /* Never return a reused/corrupt slot as the requested incident. */
+        } else {
+            *out = read_blob.rec;
+            if (id_out) {
+                *id_out = read_blob.id;
+            }
+        }
     }
-    *out = slots[slot].blob.rec;
     k_mutex_unlock(&watchdog_store_lock);
-    return 0;
+    k_mutex_unlock(&watchdog_store_write_lock);
+    return ret;
+}
+
+int zmk_watchdog_store_get(uint16_t index, struct zmk_watchdog_incident_record *out) {
+    return out ? get_record(index, false, out, NULL) : -EINVAL;
+}
+
+int zmk_watchdog_store_get_by_id(uint16_t id, struct zmk_watchdog_incident_record *out) {
+    return out ? get_record(id, true, out, NULL) : -EINVAL;
 }
 
 int zmk_watchdog_store_get_with_id(uint16_t index, struct zmk_watchdog_incident_record *out,
                                    uint16_t *id_out) {
-    if (!out || !id_out) {
-        return -EINVAL;
-    }
-
-    k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-    int slot = find_slot_by_enum_index_locked(index);
-    if (slot < 0) {
-        k_mutex_unlock(&watchdog_store_lock);
-        return -ENOENT;
-    }
-    *out = slots[slot].blob.rec;
-    *id_out = slots[slot].blob.id;
-    k_mutex_unlock(&watchdog_store_lock);
-    return 0;
+    return out && id_out ? get_record(index, false, out, id_out) : -EINVAL;
 }
 
 uint16_t zmk_watchdog_store_capacity(void) { return CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS; }
@@ -495,51 +574,17 @@ static int watchdog_settings_set(const char *name, size_t len, settings_read_cb 
             return -ENOENT;
         }
 
-        struct watchdog_store_slot_blob blob = {0};
-        if (len != sizeof(blob) && len != WATCHDOG_STORE_V1_BLOB_SIZE &&
-            len != WATCHDOG_STORE_V2_BLOB_SIZE && len != WATCHDOG_STORE_V3_BLOB_SIZE) {
-            return -EINVAL;
-        }
-        ssize_t read = read_cb(cb_arg, &blob, len);
-        if (read < 0) {
-            return (int)read;
-        }
-        if ((size_t)read != len) {
-            return -EIO;
-        }
-        if (blob.rec.type > ZMK_WATCHDOG_INCIDENT_RESET_CAUSE) {
-            return -EINVAL;
-        }
-        if ((len == WATCHDOG_STORE_V1_BLOB_SIZE && blob.rec.version != 1) ||
-            (len == WATCHDOG_STORE_V2_BLOB_SIZE && blob.rec.version != 2) ||
-            (len == WATCHDOG_STORE_V3_BLOB_SIZE && blob.rec.version != 3) ||
-            (len == sizeof(blob) && blob.rec.version != ZMK_WATCHDOG_RECORD_VERSION)) {
-            return -EINVAL;
-        }
-        if (blob.rec.version == 1 && blob.rec.type == ZMK_WATCHDOG_INCIDENT_FREEZE) {
-            /* Preserve queue/channel, but never interpret legacy reserved or
-             * unused union bytes as diagnostic state/pointers. No flash write. */
-            blob.rec.detail.freeze.thread_state = 0;
-            blob.rec.detail.freeze.trace_flags = 0;
-            blob.rec.detail.freeze.trace_count = 0;
-            blob.rec.detail.freeze.wait_queue = 0;
-            blob.rec.detail.freeze.stack_pointer = 0;
-            memset(blob.rec.detail.freeze.addresses, 0, sizeof(blob.rec.detail.freeze.addresses));
-        }
-
-        if (blob.rec.version < 4) {
-            blob.rec.flags &= ~ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID;
-        }
-        if (blob.rec.version < 3) {
-            blob.rec.flags = 0;
-            if (blob.rec.type == ZMK_WATCHDOG_INCIDENT_FATAL) {
-                memset(blob.rec.detail.fatal.context, 0, sizeof(blob.rec.detail.fatal.context));
-            }
+        struct watchdog_store_slot_blob blob;
+        int ret = decode_slot_blob(len, read_cb, cb_arg, &blob);
+        if (ret < 0) {
+            return ret;
         }
 
         k_mutex_lock(&watchdog_store_lock, K_FOREVER);
-        slots[slot_index].used = true;
-        slots[slot_index].blob = blob;
+        slots[slot_index] = (struct watchdog_store_slot){.boot_ordinal = blob.rec.boot_ordinal,
+                                                         .id = blob.id,
+                                                         .version = blob.rec.version,
+                                                         .used = true};
         k_mutex_unlock(&watchdog_store_lock);
         return 0;
     }
@@ -563,9 +608,8 @@ static int watchdog_settings_commit(void) {
      * Reconcile the ordinal too, or reboot can create ties and overwrite newer history.
      * Preserve an advanced cursor after deletion, and compare modulo the counter width. */
     for (size_t i = 0; i < ARRAY_SIZE(slots); i++) {
-        if (slots[i].used &&
-            (int32_t)(slots[i].blob.rec.boot_ordinal - meta.next_boot_ordinal) >= 0) {
-            meta.next_boot_ordinal = slots[i].blob.rec.boot_ordinal + 1U;
+        if (slots[i].used && (int32_t)(slots[i].boot_ordinal - meta.next_boot_ordinal) >= 0) {
+            meta.next_boot_ordinal = slots[i].boot_ordinal + 1U;
         }
     }
     settings_loaded = true;

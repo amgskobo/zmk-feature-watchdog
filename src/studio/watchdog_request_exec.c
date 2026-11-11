@@ -136,12 +136,16 @@ static void handle_list_incidents(const cormoran_watchdog_ListIncidentsRequest *
         struct zmk_watchdog_incident_record rec;
         uint16_t id;
         int ret = zmk_watchdog_store_get_with_id((uint16_t)i, &rec, &id);
-        if (ret < 0) {
+        if (ret == -ENOENT) {
             /* Store mutated concurrently (delete) between count() and
              * get_with_id() -- stop the page here rather than erroring the
              * whole request; the client will see a shorter page than
              * `total` implied and can re-request if it cares. */
             break;
+        }
+        if (ret < 0) {
+            watchdog_response_set_error(resp, "Failed to read incident history");
+            return;
         }
 
         /* Source 0: this always reads this half's own store. The central

@@ -70,8 +70,11 @@ rewriting history. Unknown kinds, corrupt lengths and malformed keys reject
 without cache mutation. The 80-byte diagnostic extension and fatal context are
 zeroed on v1/v2 loads. The new 192-byte common extension is zero on v1-v3
 loads, and an old reserved flag cannot claim that extension. Existing records
-are neither rewritten nor renumbered. The store costs 192 additional RAM bytes
-per configured slot; protocol buffers and capture state add fixed costs. Check
+are neither rewritten nor renumbered. The RAM index costs eight bytes per
+configured slot, and a single 340-byte read buffer is shared by serialized
+getters. Sixteen slots use 468 bytes instead of the former 5456-byte history
+cache; metadata, mutexes, protocol buffers and capture state are separate fixed
+costs. No heap or record-sized getter stack buffer replaces that cache. Check
 the selected firmware's linked RAM/Flash totals separately.
 
 The incident ordinal increments per persisted incident, not per boot. Incident
@@ -91,10 +94,17 @@ gate, not a global Flash write-rate or wear guarantee; free slots and multiple
 qualifying appends are separate cases.
 Partial delete failure keeps failed records and successful deletions for retry.
 
-Settings readiness comes from the module's h_commit. Writers do not hold the
-RAM mutex across settings I/O. Append callbacks run outside module locks. Status
-reads take one coherent RAM snapshot. Fixed record strings are bounded before RPC
-encoding, including records whose name field has no terminating NUL.
+Settings readiness comes from the module's h_commit. Persisted reads and writers
+share a serialization mutex that settings callbacks never acquire. Neither holds
+the RAM-index mutex across settings I/O. A getter snapshots the selected index,
+loads only that exact settings key through a private direct-load callback, and
+checks the returned identity and current index before publishing outputs.
+Callback/read errors are retained explicitly because this core's direct-load
+traversal discards backend return values. Missing, malformed, duplicate or
+inconsistent data is not a successful empty result; outputs remain unchanged.
+Append callbacks run outside module locks. Status/count reads take a coherent
+RAM snapshot without waiting on the I/O serialization mutex. Fixed record
+strings are bounded before RPC encoding, including nonterminated names.
 
 Record flag bit 0 marks valid Cortex-M fatal context (r0-r3, r12, xPSR).
 Bit 1 marks minimal/incomplete capture; its uptime is unavailable, not evidence

@@ -153,7 +153,7 @@ class WestCommandsTests(unittest.TestCase):
             result.stdout + result.stderr, encoding="utf-8"
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.count("PASS watchdog concurrency groups=9"), 3)
+        self.assertEqual(result.stdout.count("PASS watchdog concurrency groups=12"), 3)
 
     def test_relay_central(self):
         result = subprocess.run(

@@ -40,6 +40,9 @@ config ZMK_WATCHDOG_MAX_INCIDENTS
       Once this many incidents are stored, a new one is dropped and counted
       without writing Flash until incidents are deleted, unless
       ZMK_WATCHDOG_OVERWRITE_OLDEST is enabled.
+      RAM uses an 8-byte index per slot and one shared 340-byte read buffer;
+      complete history bodies stay in settings. Retrieval may block on
+      settings I/O; count/status remain RAM-only.
 
 config ZMK_WATCHDOG_OVERWRITE_OLDEST
     bool "Overwrite the oldest stored incident when the store is full"

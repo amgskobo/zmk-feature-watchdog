@@ -37,8 +37,12 @@ K_SEM_DEFINE(allow_save, 0, 1);
 K_THREAD_STACK_DEFINE(load_stack, 4096);
 K_THREAD_STACK_DEFINE(writer_stack, 4096);
 K_THREAD_STACK_DEFINE(second_stack, 4096);
-static struct k_thread loader, writer, second_writer;
-static struct watchdog_store_slot disk[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
+K_THREAD_STACK_DEFINE(reader_stack, 4096);
+static struct k_thread loader, writer, second_writer, reader;
+static struct {
+    bool used;
+    struct watchdog_store_slot_blob blob;
+} disk[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
 static struct watchdog_store_meta disk_meta;
 static bool pause_load, pause_save, monitor_api;
 static atomic_t writes, callbacks;
@@ -87,6 +91,7 @@ static ssize_t read_value(void *context, void *value, size_t size) {
 static int backend_load(struct settings_store *store, const struct settings_load_arg *arg) {
     ARG_UNUSED(store);
     if (pause_load) {
+        pause_load = false;
         k_sem_give(&load_entered);
         CHECK(k_sem_take(&allow_load, K_SECONDS(1)) == 0);
     }
@@ -169,6 +174,23 @@ static void writer_thread(void *a, void *b, void *c) {
 static void second_thread(void *a, void *b, void *c) {
     struct zmk_watchdog_incident_record rec = {.uptime_s = 300};
     second_result = zmk_watchdog_store_append(&rec);
+}
+
+struct read_job {
+    uint16_t id;
+    int result;
+    struct zmk_watchdog_incident_record record;
+};
+
+static void reader_thread(void *a, void *b, void *c) {
+    struct read_job *job = a;
+    job->result = zmk_watchdog_store_get_by_id(job->id, &job->record);
+}
+
+static void start_reader(struct read_job *job) {
+    job->result = 99;
+    k_thread_create(&reader, reader_stack, K_THREAD_STACK_SIZEOF(reader_stack), reader_thread, job,
+                    NULL, NULL, 5, 0, K_NO_WAIT);
 }
 
 static void start_load(void) {
@@ -295,6 +317,80 @@ static void save_vs_load_and_writer(void) {
     CHECK(disk[0].blob.rec.uptime_s == 200 && disk[1].blob.rec.uptime_s == 300);
     verify_disk();
     printk("PASS save vs load and second writer time=%lld\n", k_uptime_get());
+}
+
+static void read_vs_delete(void) {
+    CHECK(zmk_watchdog_store_delete_all() == 0);
+    struct zmk_watchdog_incident_record rec = {.uptime_s = 111};
+    CHECK(zmk_watchdog_store_append(&rec) == 0);
+    struct zmk_watchdog_incident_record stored;
+    CHECK(zmk_watchdog_store_get_with_id(0, &stored, &target_id) == 0);
+    struct read_job job = {.id = target_id};
+    pause_load = true;
+    start_reader(&job);
+    CHECK(k_sem_take(&load_entered, K_SECONDS(1)) == 0);
+    writer_operation = DELETE;
+    start_writer();
+    k_sleep(K_MSEC(20));
+    CHECK(writer_result == 99 && job.result == 99);
+    CHECK(k_mutex_lock(&watchdog_store_lock, K_NO_WAIT) == 0);
+    k_mutex_unlock(&watchdog_store_lock);
+    CHECK(zmk_watchdog_store_count() == 1);
+    pause_load = false;
+    k_sem_give(&allow_load);
+    CHECK(k_thread_join(&reader, K_SECONDS(1)) == 0 && job.result == 0);
+    CHECK(k_thread_join(&writer, K_SECONDS(1)) == 0 && writer_result == 0);
+    CHECK(!memcmp(&job.record, &stored, sizeof(stored)));
+    CHECK(zmk_watchdog_store_count() == 0);
+    printk("PASS persisted read vs delete keeps selected record time=%lld\n", k_uptime_get());
+}
+
+static void save_vs_read(void) {
+    struct zmk_watchdog_incident_record rec = {.uptime_s = 222};
+    CHECK(zmk_watchdog_store_append(&rec) == 0);
+    struct zmk_watchdog_incident_record stored;
+    CHECK(zmk_watchdog_store_get_with_id(0, &stored, &target_id) == 0);
+    writer_operation = APPEND;
+    pause_save = true;
+    start_writer();
+    CHECK(k_sem_take(&save_entered, K_SECONDS(1)) == 0);
+    struct read_job job = {.id = target_id};
+    start_reader(&job);
+    k_sleep(K_MSEC(20));
+    CHECK(job.result == 99);
+    struct zmk_watchdog_store_status status;
+    zmk_watchdog_store_get_status(&status);
+    CHECK(status.stored == 1);
+    k_sem_give(&allow_save);
+    CHECK(k_thread_join(&writer, K_SECONDS(1)) == 0 && writer_result == 0);
+    CHECK(k_thread_join(&reader, K_SECONDS(1)) == 0 && job.result == 0);
+    CHECK(!memcmp(&job.record, &stored, sizeof(stored)));
+    verify_disk();
+    printk("PASS persisted read waits for save; status remains available time=%lld\n",
+           k_uptime_get());
+}
+
+static void two_readers(void) {
+    CHECK(zmk_watchdog_store_count() == 2);
+    struct read_job first = {0}, other = {.result = 99};
+    struct zmk_watchdog_incident_record expected_first, expected_other;
+    CHECK(zmk_watchdog_store_get_with_id(0, &expected_first, &first.id) == 0);
+    CHECK(zmk_watchdog_store_get_with_id(1, &expected_other, &other.id) == 0);
+    CHECK(expected_first.uptime_s != expected_other.uptime_s);
+    pause_load = true;
+    start_reader(&first);
+    CHECK(k_sem_take(&load_entered, K_SECONDS(1)) == 0);
+    k_thread_create(&second_writer, second_stack, K_THREAD_STACK_SIZEOF(second_stack),
+                    reader_thread, &other, NULL, NULL, 5, 0, K_NO_WAIT);
+    k_sleep(K_MSEC(20));
+    CHECK(first.result == 99 && other.result == 99);
+    pause_load = false;
+    k_sem_give(&allow_load);
+    CHECK(k_thread_join(&reader, K_SECONDS(1)) == 0 && first.result == 0);
+    CHECK(k_thread_join(&second_writer, K_SECONDS(1)) == 0 && other.result == 0);
+    CHECK(!memcmp(&first.record, &expected_first, sizeof(expected_first)));
+    CHECK(!memcmp(&other.record, &expected_other, sizeof(expected_other)));
+    printk("PASS two persisted readers keep independent outputs time=%lld\n", k_uptime_get());
 }
 
 static void pending_failure_recovery(void) {
@@ -427,6 +523,9 @@ int main(void) {
     parallel_pending_conversion();
     corrupt_and_full_pending();
     reset_audit_failure_recovery();
-    printk("PASS watchdog concurrency groups=9\n");
+    read_vs_delete();
+    save_vs_read();
+    two_readers();
+    printk("PASS watchdog concurrency groups=12\n");
     exit(0);
 }

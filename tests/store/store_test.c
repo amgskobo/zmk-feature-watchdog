@@ -16,12 +16,20 @@
 #define WATCHDOG_STORE_OVERWRITES 0
 #endif
 
-static struct watchdog_store_slot flash_slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
+static struct flash_slot {
+    bool used;
+    struct watchdog_store_slot_blob blob;
+} flash_slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
+static size_t flash_lengths[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
 static struct watchdog_store_meta flash_meta;
 static bool flash_has_meta;
 static int save_failure, meta_failure;
 static int delete_failure[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS];
 static unsigned saves, deletes, notifications;
+static ssize_t backend_read_result = -1;
+static int backend_traversal_error;
+static bool omit_backend_record, duplicate_backend_record, change_index_during_read;
+static unsigned backend_reads;
 
 static unsigned slot_number(const char *name) {
     unsigned slot = UINT32_MAX;
@@ -48,6 +56,7 @@ int settings_save_one(const char *name, const void *value, size_t length) {
         assert(length == sizeof(flash_slots[slot].blob));
         flash_slots[slot].used = true;
         memcpy(&flash_slots[slot].blob, value, length);
+        flash_lengths[slot] = length;
     }
     return 0;
 }
@@ -92,10 +101,17 @@ static void reset_ram(void) {
 static void reset(void) {
     reset_ram();
     memset(flash_slots, 0, sizeof(flash_slots));
+    for (size_t i = 0; i < ARRAY_SIZE(flash_lengths); i++) {
+        flash_lengths[i] = sizeof(struct watchdog_store_slot_blob);
+    }
     memset(delete_failure, 0, sizeof(delete_failure));
     flash_has_meta = false;
     saves = deletes = notifications = 0;
     save_failure = meta_failure = 0;
+    backend_read_result = -1;
+    backend_traversal_error = 0;
+    omit_backend_record = duplicate_backend_record = change_index_during_read = false;
+    backend_reads = 0;
     zmk_watchdog_store_set_appended_callback(notify);
     assert(watchdog_settings_commit() == 0);
 }
@@ -113,11 +129,65 @@ static ssize_t read_value(void *context, void *value, size_t length) {
     return read->result;
 }
 
+/* A successful initial load describes persisted bytes. Keep those bytes in
+ * the fake backend too, so later production reads traverse storage. The
+ * original callbacks and their exact read counts still run once. */
+struct captured_load {
+    settings_read_cb read_cb;
+    void *arg;
+    struct watchdog_store_slot_blob raw;
+};
+
+static ssize_t capture_load(void *arg, void *value, size_t length) {
+    struct captured_load *load = arg;
+    ssize_t read = load->read_cb(load->arg, value, length);
+    if (read > 0) {
+        memcpy(&load->raw, value, (size_t)read);
+    }
+    return read;
+}
+
+static int load_setting(const char *name, size_t len, settings_read_cb read_cb, void *arg) {
+    struct captured_load load = {.read_cb = read_cb, .arg = arg};
+    int ret = watchdog_settings_set(name, len, capture_load, &load);
+    if (ret == 0 && strncmp(name, "i/", 2) == 0) {
+        unsigned slot;
+        assert(sscanf(name, "i/%u", &slot) == 1 && slot < ARRAY_SIZE(flash_slots));
+        flash_slots[slot].used = true;
+        flash_slots[slot].blob = load.raw;
+        flash_lengths[slot] = len;
+    }
+    return ret;
+}
+
+int settings_load_subtree_direct(const char *name, settings_load_direct_cb cb, void *arg) {
+    assert(!watchdog_store_lock.held && watchdog_store_write_lock.held);
+    backend_reads++;
+    if (backend_traversal_error) {
+        return backend_traversal_error;
+    }
+    unsigned slot = slot_number(name);
+    if (flash_slots[slot].used && !omit_backend_record) {
+        size_t length = flash_lengths[slot];
+        struct read_value value = {&flash_slots[slot].blob, backend_read_result == -1
+                                                                ? (ssize_t)length
+                                                                : backend_read_result};
+        assert(cb(NULL, length, read_value, &value, arg) == 0);
+        if (duplicate_backend_record) {
+            assert(cb("", length, read_value, &value, arg) == 0);
+        }
+        if (change_index_during_read) {
+            slots[slot].id++;
+        }
+    }
+    return 0;
+}
+
 static void reload(void) {
     reset_ram();
     if (flash_has_meta) {
         struct read_value value = {&flash_meta, sizeof(flash_meta)};
-        assert(watchdog_settings_set("meta", sizeof(flash_meta), read_value, &value) == 0);
+        assert(load_setting("meta", sizeof(flash_meta), read_value, &value) == 0);
     }
     for (size_t i = 0; i < ARRAY_SIZE(flash_slots); i++) {
         if (!flash_slots[i].used) {
@@ -125,8 +195,8 @@ static void reload(void) {
         }
         char name[24];
         snprintf(name, sizeof(name), "i/%zu", i);
-        struct read_value value = {&flash_slots[i].blob, sizeof(flash_slots[i].blob)};
-        assert(watchdog_settings_set(name, sizeof(flash_slots[i].blob), read_value, &value) == 0);
+        struct read_value value = {&flash_slots[i].blob, flash_lengths[i]};
+        assert(load_setting(name, flash_lengths[i], read_value, &value) == 0);
     }
     assert(watchdog_settings_commit() == 0);
 }
@@ -355,27 +425,27 @@ static void settings_read_failures(void) {
     reset();
     struct watchdog_store_meta proposed = {.next_boot_ordinal = 88, .next_id = 42};
     struct read_value value = {&proposed, sizeof(proposed)};
-    assert(watchdog_settings_set("unknown", sizeof(proposed), read_value, &value) == -ENOENT);
-    assert(watchdog_settings_set("meta", sizeof(proposed) - 1, read_value, &value) == -EINVAL);
+    assert(load_setting("unknown", sizeof(proposed), read_value, &value) == -ENOENT);
+    assert(load_setting("meta", sizeof(proposed) - 1, read_value, &value) == -EINVAL);
     for (ssize_t result = 0; result < (ssize_t)sizeof(proposed); result++) {
         value.result = result;
-        assert(watchdog_settings_set("meta", sizeof(proposed), read_value, &value) == -EIO);
+        assert(load_setting("meta", sizeof(proposed), read_value, &value) == -EIO);
         assert(meta.next_boot_ordinal == 1 && meta.next_id == 1);
     }
     value.result = -ENOMEM;
-    assert(watchdog_settings_set("meta", sizeof(proposed), read_value, &value) == -ENOMEM);
+    assert(load_setting("meta", sizeof(proposed), read_value, &value) == -ENOMEM);
     struct watchdog_store_slot_blob blob = {
         .id = 55, .rec = {.version = ZMK_WATCHDOG_RECORD_VERSION, .uptime_s = 77}};
     value = (struct read_value){&blob, sizeof(blob)};
-    assert(watchdog_settings_set("i/bad", sizeof(blob), read_value, &value) == -ENOENT);
-    assert(watchdog_settings_set("i/999", sizeof(blob), read_value, &value) == -ENOENT);
+    assert(load_setting("i/bad", sizeof(blob), read_value, &value) == -ENOENT);
+    assert(load_setting("i/999", sizeof(blob), read_value, &value) == -ENOENT);
     for (ssize_t result = 0; result < (ssize_t)sizeof(blob); result++) {
         value.result = result;
-        assert(watchdog_settings_set("i/0", sizeof(blob), read_value, &value) == -EIO);
+        assert(load_setting("i/0", sizeof(blob), read_value, &value) == -EIO);
         assert(zmk_watchdog_store_count() == 0);
     }
     value.result = sizeof(blob);
-    assert(watchdog_settings_set("i/0", sizeof(blob), read_value, &value) == 0);
+    assert(load_setting("i/0", sizeof(blob), read_value, &value) == 0);
     struct zmk_watchdog_incident_record record;
     assert(zmk_watchdog_store_get_by_id(55, &record) == 0 && record.uptime_s == 77);
 }
@@ -404,22 +474,24 @@ static void slot_key_validation(void) {
                              "i/9999999999999999999999999999999999999999"};
     slot_key_reads = 0;
     for (size_t i = 0; i < ARRAY_SIZE(invalid); i++) {
-        assert(watchdog_settings_set(invalid[i], sizeof(blob), read_slot_key, &value) == -ENOENT);
+        assert(load_setting(invalid[i], sizeof(blob), read_slot_key, &value) == -ENOENT);
         assert(slot_key_reads == 0);
         assert(memcmp(before, slots, sizeof(before)) == 0);
         assert(memcmp(&before_meta, &meta, sizeof(meta)) == 0);
     }
     char name[24];
     snprintf(name, sizeof(name), "i/%u", CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS);
-    assert(watchdog_settings_set(name, sizeof(blob), read_slot_key, &value) == -ENOENT);
+    assert(load_setting(name, sizeof(blob), read_slot_key, &value) == -ENOENT);
     assert(slot_key_reads == 0 && memcmp(before, slots, sizeof(before)) == 0);
     snprintf(name, sizeof(name), "i/%u", CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS - 1);
-    assert(watchdog_settings_set(name, sizeof(blob), read_slot_key, &value) == 0);
+    assert(load_setting(name, sizeof(blob), read_slot_key, &value) == 0);
     assert(slot_key_reads == 1);
-    assert(slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS - 1].blob.id == 55);
+    assert(slots[CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS - 1].id == 55);
     blob.id = 56;
-    assert(watchdog_settings_set("i/0", sizeof(blob), read_slot_key, &value) == 0);
-    assert(slot_key_reads == 2 && slots[0].blob.id == 56 && slots[0].blob.rec.uptime_s == 77);
+    assert(load_setting("i/0", sizeof(blob), read_slot_key, &value) == 0);
+    assert(slot_key_reads == 2 && slots[0].id == 56);
+    struct zmk_watchdog_incident_record rec;
+    assert(zmk_watchdog_store_get_by_id(56, &rec) == 0 && rec.uptime_s == 77);
 }
 
 static void record_formats(void) {
@@ -443,11 +515,11 @@ static void record_formats(void) {
         struct read_value value = {legacy, sizeof(legacy)};
         for (ssize_t n = 0; n < (ssize_t)sizeof(legacy); ++n) {
             value.result = n;
-            assert(watchdog_settings_set("i/0", sizeof(legacy), read_value, &value) == -EIO);
+            assert(load_setting("i/0", sizeof(legacy), read_value, &value) == -EIO);
             assert(zmk_watchdog_store_count() == 0);
         }
         value.result = sizeof(legacy);
-        assert(watchdog_settings_set("i/0", sizeof(legacy), read_value, &value) == 0);
+        assert(load_setting("i/0", sizeof(legacy), read_value, &value) == 0);
         struct zmk_watchdog_incident_record rec;
         assert(zmk_watchdog_store_get_by_id(53, &rec) == 0);
         assert(rec.version == 1 && rec.type == kind && rec.boot_ordinal == 7 && rec.uptime_s == 91);
@@ -466,7 +538,7 @@ static void record_formats(void) {
         }
         struct watchdog_store_slot unchanged = slots[0];
         legacy[4] = 2;
-        assert(watchdog_settings_set("i/0", sizeof(legacy), read_value, &value) == -EINVAL);
+        assert(load_setting("i/0", sizeof(legacy), read_value, &value) == -EINVAL);
         assert(memcmp(&unchanged, &slots[0], sizeof(unchanged)) == 0);
     }
     reset();
@@ -496,12 +568,13 @@ static void record_formats(void) {
     struct zmk_watchdog_incident_record reloaded;
     assert(zmk_watchdog_store_get_by_id(1, &reloaded) == 0);
     assert(memcmp(&trace, &reloaded, sizeof(trace)) == 0 && saves == 2);
+    struct watchdog_store_slot_blob v4 = flash_slots[0].blob;
     uint8_t v3[148];
-    memcpy(v3, &slots[0].blob, sizeof(v3));
+    memcpy(v3, &flash_slots[0].blob, sizeof(v3));
     v3[4] = 3;
     /* An old record cannot claim the new extension, even with a reserved bit set. */
     struct read_value v3_value = {v3, sizeof(v3)};
-    assert(watchdog_settings_set("i/0", sizeof(v3), read_value, &v3_value) == 0);
+    assert(load_setting("i/0", sizeof(v3), read_value, &v3_value) == 0);
     assert(zmk_watchdog_store_get_by_id(1, &reloaded) == 0 && reloaded.version == 3);
     assert(!(reloaded.flags & ZMK_WATCHDOG_CAPTURE_CONTEXT_VALID));
     assert(!memcmp(reloaded.diagnostics, trace.diagnostics, sizeof(trace.diagnostics)));
@@ -509,21 +582,20 @@ static void record_formats(void) {
         assert(reloaded.capture_context[i] == 0);
     }
     uint8_t v2[68];
-    memcpy(v2, &slots[0].blob, sizeof(v2));
+    memcpy(v2, &flash_slots[0].blob, sizeof(v2));
     v2[4] = 2;
     struct read_value old_value = {v2, sizeof(v2)};
     unsigned before_saves = saves;
-    assert(watchdog_settings_set("i/0", sizeof(v2), read_value, &old_value) == 0);
+    assert(load_setting("i/0", sizeof(v2), read_value, &old_value) == 0);
     assert(zmk_watchdog_store_get_by_id(1, &reloaded) == 0 && reloaded.version == 2);
     assert(memcmp(&reloaded.detail.freeze, &trace.detail.freeze, sizeof(trace.detail.freeze)) == 0);
     for (size_t i = 0; i < sizeof(reloaded.diagnostics); ++i) {
         assert(reloaded.diagnostics[i] == 0);
     }
     assert(saves == before_saves);
-    assert(watchdog_settings_set(
-               "i/0", sizeof(slots[0].blob), read_value,
-               &(struct read_value){&flash_slots[0].blob, sizeof(slots[0].blob)}) == 0);
-    struct watchdog_store_slot_blob bad = slots[0].blob;
+    assert(load_setting("i/0", sizeof(flash_slots[0].blob), read_value,
+                        &(struct read_value){&v4, sizeof(v4)}) == 0);
+    struct watchdog_store_slot_blob bad = flash_slots[0].blob;
     struct watchdog_store_slot unchanged = slots[0];
     struct read_value value = {&bad, sizeof(bad)};
     for (unsigned version = 0; version < 6; ++version) {
@@ -531,7 +603,7 @@ static void record_formats(void) {
             continue;
         }
         bad.rec.version = version;
-        assert(watchdog_settings_set("i/0", sizeof(bad), read_value, &value) == -EINVAL);
+        assert(load_setting("i/0", sizeof(bad), read_value, &value) == -EINVAL);
         assert(memcmp(&unchanged, &slots[0], sizeof(unchanged)) == 0);
     }
 }
@@ -545,10 +617,10 @@ static void unsupported_record_types(void) {
     rec.type = ZMK_WATCHDOG_INCIDENT_FATAL;
     assert(zmk_watchdog_store_append(&rec) == 0);
     struct watchdog_store_slot unchanged = slots[0];
-    struct watchdog_store_slot_blob bad = slots[0].blob;
+    struct watchdog_store_slot_blob bad = flash_slots[0].blob;
     bad.rec.type = 3;
     struct read_value value = {&bad, sizeof(bad)};
-    assert(watchdog_settings_set("i/0", sizeof(bad), read_value, &value) == -EINVAL);
+    assert(load_setting("i/0", sizeof(bad), read_value, &value) == -EINVAL);
     assert(!memcmp(&unchanged, &slots[0], sizeof(unchanged)));
     struct zmk_watchdog_store_status status;
     zmk_watchdog_store_get_status(&status);
@@ -557,8 +629,96 @@ static void unsupported_record_types(void) {
            status.recording_stopped == (status.capacity == 1 && !WATCHDOG_STORE_OVERWRITES));
 }
 
+static void assert_read_error(int expected) {
+    struct zmk_watchdog_incident_record out, unchanged;
+    memset(&unchanged, 0xa5, sizeof(unchanged));
+    out = unchanged;
+    uint16_t id = 0xbeef;
+    assert(zmk_watchdog_store_get(0, &out) == expected);
+    assert(!memcmp(&out, &unchanged, sizeof(out)));
+    assert(zmk_watchdog_store_get_by_id(1, &out) == expected);
+    assert(!memcmp(&out, &unchanged, sizeof(out)));
+    assert(zmk_watchdog_store_get_with_id(0, &out, &id) == expected);
+    assert(id == 0xbeef && !memcmp(&out, &unchanged, sizeof(out)));
+}
+
+static void persisted_reads(void) {
+    reset();
+    struct zmk_watchdog_incident_record record = {.type = ZMK_WATCHDOG_INCIDENT_FATAL,
+                                                  .uptime_s = 1234};
+    for (size_t i = 0; i < sizeof(record.diagnostics); i++) {
+        record.diagnostics[i] = (uint8_t)(i + 1);
+    }
+    for (size_t i = 0; i < sizeof(record.capture_context); i++) {
+        record.capture_context[i] = (uint8_t)(i ^ 0x5a);
+    }
+    assert(zmk_watchdog_store_append(&record) == 0);
+    assert(sizeof(slots) + sizeof(read_blob) <= 8U * CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS + 340U);
+    unsigned before = backend_reads, before_saves = saves, before_deletes = deletes;
+    struct zmk_watchdog_store_status status;
+    zmk_watchdog_store_get_status(&status);
+    assert(status.stored == 1 && zmk_watchdog_store_count() == 1);
+    assert(zmk_watchdog_store_is_ready() && backend_reads == before);
+    struct zmk_watchdog_incident_record out;
+    assert(zmk_watchdog_store_get(1, &out) == -ENOENT && backend_reads == before);
+    assert(zmk_watchdog_store_get_by_id(2, &out) == -ENOENT && backend_reads == before);
+
+    /* Every short read, missing entry, malformed header and backend failure
+     * is observable without changing any caller output or deleting history. */
+    for (ssize_t n = 0; n < (ssize_t)sizeof(struct watchdog_store_slot_blob); n++) {
+        backend_read_result = n;
+        assert_read_error(-EIO);
+    }
+    backend_read_result = -ENOMEM;
+    assert_read_error(-ENOMEM);
+    backend_read_result = -1;
+    backend_traversal_error = -ETIMEDOUT;
+    assert_read_error(-ETIMEDOUT);
+    backend_traversal_error = 0;
+    omit_backend_record = true;
+    assert_read_error(-EIO);
+    omit_backend_record = false;
+    duplicate_backend_record = true;
+    assert_read_error(-EEXIST);
+    duplicate_backend_record = false;
+
+    struct watchdog_store_slot_blob saved = flash_slots[0].blob;
+    flash_slots[0].blob.id++;
+    assert_read_error(-EIO);
+    flash_slots[0].blob = saved;
+    flash_slots[0].blob.rec.boot_ordinal++;
+    assert_read_error(-EIO);
+    flash_slots[0].blob = saved;
+    flash_slots[0].blob.rec.version = 3;
+    assert_read_error(-EINVAL);
+    flash_slots[0].blob = saved;
+    flash_slots[0].blob.rec.type = 3;
+    assert_read_error(-EINVAL);
+    flash_slots[0].blob = saved;
+    flash_lengths[0]--;
+    assert_read_error(-EINVAL);
+    flash_lengths[0]++;
+
+    change_index_during_read = true;
+    memset(&out, 0xa5, sizeof(out));
+    struct zmk_watchdog_incident_record unchanged = out;
+    uint16_t id = 0xbeef;
+    assert(zmk_watchdog_store_get_with_id(0, &out, &id) == -EAGAIN);
+    assert(id == 0xbeef && !memcmp(&out, &unchanged, sizeof(out)));
+    change_index_during_read = false;
+    slots[0].id--;
+    assert(zmk_watchdog_store_get_with_id(0, &out, &id) == 0 && id == 1);
+    assert(!memcmp(&out, &record, sizeof(out)));
+    /* A second query really reads storage; no stale record-sized RAM cache. */
+    flash_slots[0].blob.rec.capture_context[191] ^= 0xff;
+    record.capture_context[191] ^= 0xff;
+    assert(zmk_watchdog_store_get_by_id(1, &out) == 0);
+    assert(!memcmp(&out, &record, sizeof(out)));
+    assert(saves == before_saves && deletes == before_deletes);
+}
+
 #ifdef CONFIG_ZMK_WATCHDOG_OVERWRITE_OLDEST
-#define WATCHDOG_STORE_GROUPS 12
+#define WATCHDOG_STORE_GROUPS 13
 /* Present ids (1-based) must be exactly the newest `cap` after `last` appends. */
 static void assert_newest_ids(unsigned last) {
     const unsigned cap = CONFIG_ZMK_WATCHDOG_MAX_INCIDENTS;
@@ -729,7 +889,7 @@ static void overwrite_oldest(void) {
     meta_failure = 0;
 }
 #else
-#define WATCHDOG_STORE_GROUPS 11
+#define WATCHDOG_STORE_GROUPS 12
 #endif
 
 int main(void) {
@@ -753,6 +913,7 @@ int main(void) {
     slot_key_validation();
     record_formats();
     unsupported_record_types();
+    persisted_reads();
 #ifdef CONFIG_ZMK_WATCHDOG_OVERWRITE_OLDEST
     overwrite_oldest();
 #endif

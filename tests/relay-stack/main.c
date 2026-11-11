@@ -23,6 +23,7 @@ K_SEM_DEFINE(transport_entered, 0, 1);
 K_SEM_DEFINE(transport_release, 0, 1);
 bool store_ready, previous_available = true;
 int read_error_index = -1;
+static int read_error_code = -EIO;
 unsigned reads, breadcrumbs, last_breadcrumb;
 static uint8_t checkpoint[80];
 
@@ -114,7 +115,7 @@ int zmk_watchdog_store_get_with_id(uint16_t index, struct zmk_watchdog_incident_
                                    uint16_t *id) {
     reads++;
     if (index == read_error_index) {
-        return -EIO;
+        return read_error_code;
     }
     if (index >= stored) {
         return -ENOENT;
@@ -326,6 +327,43 @@ static void queued_requests(void) {
     expect_status(111);
     CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
     printk("REQUESTCASE queued-two ordered_ids=110,111\n");
+}
+
+static void persisted_read_failures(void) {
+    const int errors[] = {-EIO, -EINVAL, -EAGAIN};
+    read_error_index = 2; /* Two valid records must not hide a later read failure. */
+    for (unsigned i = 0; i < ARRAY_SIZE(errors); i++) {
+        read_error_code = errors[i];
+        cormoran_watchdog_RelayRequest query = cormoran_watchdog_RelayRequest_init_zero;
+        query.request_id = 700 + i;
+        query.has_request = true;
+        query.request.which_request_type = cormoran_watchdog_Request_list_incidents_tag;
+        struct zmk_watchdog_relay_request wire = {0};
+        pb_ostream_t output = pb_ostream_from_buffer(wire.payload, sizeof(wire.payload));
+        CHECK(pb_encode(&output, cormoran_watchdog_RelayRequest_fields, &query));
+        wire.size = output.bytes_written;
+        raise_zmk_watchdog_relay_request(wire);
+        enqueue_status(800 + i);
+        flush_requests();
+        struct zmk_watchdog_relay_response answer;
+        CHECK(k_msgq_get(&sent, &answer, K_NO_WAIT) == 0);
+        cormoran_watchdog_RelayResponse response = cormoran_watchdog_RelayResponse_init_zero;
+        pb_istream_t input = pb_istream_from_buffer(answer.payload, answer.size);
+        CHECK(pb_decode(&input, cormoran_watchdog_RelayResponse_fields, &response));
+        CHECK(response.request_id == query.request_id);
+        CHECK(response.which_relay_response_type == cormoran_watchdog_RelayResponse_response_tag);
+        const cormoran_watchdog_RelayNonListResponse *result =
+            &response.relay_response_type.response;
+        CHECK(result->which_relay_non_list_response_type ==
+              cormoran_watchdog_RelayNonListResponse_error_tag);
+        CHECK(!strcmp(result->relay_non_list_response_type.error.message,
+                      "Failed to read incident history"));
+        expect_status(800 + i);
+        CHECK(k_msgq_num_used_get(&sent) == 0 && atomic_get(&overflow) == 0);
+    }
+    read_error_index = -1;
+    read_error_code = -EIO;
+    printk("REQUESTCASE persisted-read-errors explicit=3 no_partial_page=1 status_tail=3\n");
 }
 
 static void queued_failure_and_page(void) {
@@ -546,6 +584,7 @@ int main(void) {
     request(6, cormoran_watchdog_Request_list_incidents_tag, 6, 0);
     concurrent_requests();
     queued_requests();
+    persisted_read_failures();
     queued_failure_and_page();
     running_three_requests();
     full_request_queue();

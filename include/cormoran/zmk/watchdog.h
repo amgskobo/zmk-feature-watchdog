@@ -145,7 +145,13 @@ int zmk_watchdog_store_delete_all(void);
 
 /* Read the stored incident at a dense 0-based enumeration index over the
  * used slots; the order is unspecified but stable between mutations. Returns
- * 0 on success, -ENOENT if index is out of range. */
+ * 0 on success, -ENOENT if index is out of range.
+ * All three record getters are blocking thread-context APIs: they serialize
+ * with writers and read the persisted slot without holding the RAM-index
+ * mutex across settings I/O. They allocate no heap and leave all outputs
+ * unchanged on failure. Missing/inconsistent persisted data returns -EIO,
+ * invalid formats -EINVAL, backend read errors propagate, and an index changed
+ * by a concurrent settings reload returns -EAGAIN. Status/count stay RAM-only. */
 int zmk_watchdog_store_get(uint16_t index, struct zmk_watchdog_incident_record *out);
 
 /* Look up a stored incident by id. Returns 0 on success, -ENOENT if no such

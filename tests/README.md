@@ -39,7 +39,7 @@ The single [store fixture](store/store_test.c) covers:
   retained IDs remain distinct and their exact payloads remain addressable.
 - uint16 ID wrap through 65535/0/1; occupied IDs are skipped. Legacy duplicates
   remain enumerable and by-ID reads/deletes reject ambiguity without mutation.
-- Single/multiple delete errors: every failed slot stays in RAM and flash,
+- Single/multiple delete errors: every failed slot stays indexed and in flash,
   successful deletions remain deleted, first error is returned and retry works.
 - Metadata and incident reads truncated at every prefix, invalid length/name/
   index, negative read results, valid loads and unchanged cache after rejection.
@@ -51,6 +51,18 @@ The single [store fixture](store/store_test.c) covers:
   mutate the cache. Capacities 16 and 1 both exercise these cases.
 - Unsupported record kinds reject append/load without writes or mutation;
   a coherent status snapshot preserves capacity/count/drop/full relationships.
+- Persisted getters reject every short v4 read, missing/duplicate records,
+  traversal/read failures, invalid lengths/types/versions and reused identities;
+  all output bytes and returned IDs stay unchanged on error. A changed index
+  returns EAGAIN, recovery retains every diagnostic/context byte, repeated
+  retrieval reads storage and status/count do not. The history index and common
+  read buffer fit `8 * capacity + 340` bytes without heap or getter stack copies.
+
+Initial-load fixtures retain the raw successful settings bytes in their fake
+backend. Later production getters read those bytes rather than inspecting an
+internal full-record cache. Original ID, payload, legacy-prefix, rejection and
+exact key-read assertions remain; invalid loads still leave the index unchanged.
+The v4 fixture is retained explicitly while testing older format prefixes.
 
 Mutex and settings backends are controlled substitutes. These checks establish
 store behavior, not actual NVS writes, concurrent kernel scheduling, reboot,
@@ -69,12 +81,17 @@ bash tests/concurrency/run.sh
 
 It compiles the complete production store/pending/reset units with real Zephyr
 settings, mutexes and work scheduling, plus the resolved ZMK low-priority queue.
-The backend and reset-cause driver are controlled substitutes. Nine groups cover
+The backend and reset-cause driver are controlled substitutes. Twelve groups cover
 settings readiness/reset ordering, load crossing append/delete/delete-all,
 a stalled save with load and a second writer, failed pending save/backoff/recovery,
 parallel conversion/newer capture preservation, invalid CRC/type and full-store
 drop without repeated counting, and reset read/save/clear failure recovery without
-duplicate append. Raw simulated timestamps and report order are retained.
+duplicate append. Three additional groups pause real settings traversal/write
+boundaries to exercise read versus delete, save versus read with available
+RAM-only status, and two readers sharing one bounded read buffer with distinct
+outputs. Each configured pause is consumed once; a later callback read cannot
+reuse an earlier load's test barrier. Raw simulated timestamps and report order
+are retained.
 Each execution builds once and runs the identical binary three times. Set
 `WATCHDOG_NATIVE_ARTIFACTS` to retain its configuration, binary and raw run logs.
 The test also runs through `python3 -m unittest discover -v -s tests -p test_owner.py`; no radio or physical NVS/reset

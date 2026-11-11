@@ -140,9 +140,29 @@ never stops (`stopped=0`); an incident that happened sooner than
 `CONFIG_ZMK_WATCHDOG_OVERWRITE_MIN_UPTIME_S` (default 10) after boot, as in a boot loop,
 is still dropped and counted. A positive minimum uptime gates replacement by
 incident age; zero permits every incident to replace a record. This is not a
-global Flash write-rate limit or wear guarantee. RAM reads never wait for locks held
-across settings I/O. Corrupt types and bounded strings cannot become unsafe RPC
-reads. Freeze stack addresses are candidates, not a complete unwind.
+global Flash write-rate limit or wear guarantee. Corrupt types and bounded
+strings cannot become unsafe RPC reads. Freeze stack addresses are candidates,
+not a complete unwind.
+
+History bodies stay in the existing settings records. RAM holds an eight-byte
+index per slot (ID, ordinal, format and occupancy) plus one shared 340-byte read
+buffer. With sixteen slots this is 468 bytes instead of 5456 bytes of cached
+history, saving 4988 bytes on each half before linker alignment. Existing
+metadata, mutexes, pending capture and RPC/relay storage are separate costs.
+No heap allocation, capacity reduction, new periodic read or settings migration
+is introduced; v1-v4 records keep their bytes, IDs and ordering.
+
+Record retrieval is now a blocking settings read serialized with append/delete.
+The RAM-index mutex is never held across settings I/O, so status and count stay
+available during a slow read or write. All getters leave outputs unchanged on
+failure. Missing/inconsistent persisted data, malformed records and backend read
+failures are errors; Studio returns an error instead of a successful partial
+page after such a failure. A concurrent deletion can still shorten a page.
+Boot history reporting also reads storage, at its existing one-record-per-second
+pace. With matching installed images and retained history, remeasure NVS read
+latency, boot reporting, USB/BLE/Studio/split retrieval and concurrent HID before
+physical acceptance. Idle monitoring and crash-time retained capture do not read
+history from Flash.
 
 Recent diagnostics retain seven operation entries, cached state and a build tag;
 BLE observers do not log keys or peer addresses. Previous-boot CRC checkpoints

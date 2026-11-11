@@ -159,11 +159,13 @@ def main():
         passed = complete_terminal_record(text) and "RESULT: PASS failures=0" in text
         checks = [
             text.count("CASE seq=") == 7,
-            text.count("REQUESTCASE ") == 4,
+            text.count("REQUESTCASE ") == 5,
             "REQUESTCASE queued-two ordered_ids=110,111" in text,
             "REQUESTCASE running-three ordered_ids=201,202,203" in text,
             "REQUESTCASE full correlated_busy=404 recovered=405" in text,
             "REQUESTCASE malformed-page-tail page=501 packets=9 status=502" in text,
+            "REQUESTCASE persisted-read-errors explicit=3 no_partial_page=1 status_tail=3"
+            in text,
             text.count("REPORTCASE ") == 3,
             "CONTEXT_RELAY_COMPLETE records=4 fragments=12 packets=21" in text,
             "PASS: watchdog_common_context_relay_controls=8" in text,

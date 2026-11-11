@@ -15,18 +15,18 @@ import tempfile
 MUTATIONS = [
     (
         "victim-is-newest",
-        r"slots\[oldest\]\.blob\.rec\.boot_ordinal\)\s*<\s*0",
-        "slots[oldest].blob.rec.boot_ordinal) > 0",
+        r"slots\[oldest\]\.boot_ordinal\)\s*<\s*0",
+        "slots[oldest].boot_ordinal) > 0",
     ),
     (
         "victim-is-first-used",
-        r"oldest < 0 \|\|\s*\(int32_t\)\(slots\[i\]\.blob\.rec\.boot_ordinal\s*-\s*slots\[oldest\]\.blob\.rec\.boot_ordinal\)\s*<\s*0",
+        r"oldest < 0 \|\|\s*\(int32_t\)\(slots\[i\]\.boot_ordinal\s*-\s*slots\[oldest\]\.boot_ordinal\)\s*<\s*0",
         "oldest < 0",
     ),
     (
         "ordinal-not-wrap-safe",
-        r"\(int32_t\)\(slots\[i\]\.blob\.rec\.boot_ordinal\s*-\s*slots\[oldest\]\.blob\.rec\.boot_ordinal\)\s*<\s*0",
-        "slots[i].blob.rec.boot_ordinal < slots[oldest].blob.rec.boot_ordinal",
+        r"\(int32_t\)\(slots\[i\]\.boot_ordinal\s*-\s*slots\[oldest\]\.boot_ordinal\)\s*<\s*0",
+        "slots[i].boot_ordinal < slots[oldest].boot_ordinal",
     ),
     ("guard-removed", r"rec->uptime_s >= min_uptime_s", "1"),
     (
@@ -52,7 +52,7 @@ MUTATIONS = [
     ),
     (
         "stale-ordinal-on-reload",
-        r"meta.next_boot_ordinal = slots\[i\]\.blob\.rec\.boot_ordinal \+ 1U;",
+        r"meta.next_boot_ordinal = slots\[i\]\.boot_ordinal \+ 1U;",
         "meta.next_boot_ordinal = meta.next_boot_ordinal;",
     ),
 ]
